@@ -22,7 +22,7 @@ ARCH ?= amd64
 export DOCKER_CLI_EXPERIMENTAL=enabled
 
 GOARM=7
-GOLANG_VERSION = 1.16
+GOLANG_VERSION = 1.17
 REGISTRY = gcr.io/k8s-staging-autoscaling
 IMGNAME = addon-resizer
 IMAGE = $(REGISTRY)/$(IMGNAME)
@@ -53,7 +53,7 @@ buildx-setup:
 container: .container-$(ARCH)
 .container-$(ARCH): buildx-setup
 	cp -r * $(TEMP_DIR)
-	cd $(TEMP_DIR) && sed -i 's|BASEIMAGE|$(BASEIMAGE)|g' Dockerfile
+	cd $(TEMP_DIR) && sed -i- 's|BASEIMAGE|$(BASEIMAGE)|g' Dockerfile
 
 	docker run --rm -it -v $(TEMP_DIR):$(TEMP_DIR):Z -v `pwd`:/go/src/k8s.io/autoscaler/addon-resizer/:Z \
         golang:${GOLANG_VERSION} \
