@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM BASEIMAGE
+FROM gcr.io/distroless/static:latest
 
-COPY pod_nanny /
+COPY nanny /
 
-CMD /pod_nanny
+CMD /nanny
