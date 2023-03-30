@@ -37,7 +37,7 @@ ifdef HTTPS_PROXY
 endif
 
 GOARM=7
-GOLANG_VERSION = 1.17
+GOLANG_VERSION = 1.19
 REGISTRY = gcr.io/k8s-staging-autoscaling
 IMGNAME = addon-resizer
 IMAGE = $(REGISTRY)/$(IMGNAME)

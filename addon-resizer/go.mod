@@ -1,6 +1,6 @@
 module k8s.io/autoscaler/addon-resizer
 
-go 1.17
+go 1.19
 
 require (
 	github.com/golang/glog v0.0.0-20210429001901-424d2337a529
