@@ -21,7 +21,6 @@ ALL_ARCH = amd64 arm arm64 ppc64le s390x
 ARCH ?= amd64
 export DOCKER_CLI_EXPERIMENTAL=enabled
 
-BUILDDIR=$(CURDIR)
 registry_url = docker.io
 image_name = ${registry_url}/platform9/cluster-autoscaler/addon-resizer
 DOCKERFILE?=$(CURDIR)/Dockerfile
@@ -102,9 +101,9 @@ clean: $(addprefix sub-clean-,$(ALL_ARCH))
 sub-clean-%:
 	docker rmi -f $(IMAGE)-$*:$(TAG) || true
 
-pf9-image: | $(BUILDDIR) ; $(info Building Docker image for pf9 Repo...) @ ## Build SR-IOV Network device plugin docker image
+pf9-image: | $(CURDIR) ; $(info Building Docker image for pf9 Repo...) @ ## Build SR-IOV Network device plugin docker image
 	@docker build -t $(PF9_TAG) -f $(DOCKERFILE)  $(CURDIR) $(DOCKERARGS)
-	echo ${PF9_TAG} > $(BUILDDIR)/container-tag
+	echo ${PF9_TAG} > $(CURDIR)/container-tag
 
 pf9-push: 
 	docker login
