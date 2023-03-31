@@ -22,7 +22,7 @@ ARCH ?= amd64
 export DOCKER_CLI_EXPERIMENTAL=enabled
 
 BUILDDIR=$(CURDIR)
-registry_url ?= docker.io
+registry_url = docker.io
 image_name = ${registry_url}/platform9/cluster-autoscaler/addon-resizer
 DOCKERFILE?=$(CURDIR)/Dockerfile
 UPSTREAM_VERSION?=$(shell git describe --tags HEAD | sed 's/-.*//' )
@@ -42,7 +42,7 @@ REGISTRY = gcr.io/k8s-staging-autoscaling
 IMGNAME = addon-resizer
 IMAGE = $(REGISTRY)/$(IMGNAME)
 MULTI_ARCH_IMG = $(IMAGE)-$(ARCH)
-TAG = 1.8.16-pmk
+TAG = 1.8.16
 # The output type could either be docker (local), or registry.
 OUTPUT_TYPE ?= docker
 
