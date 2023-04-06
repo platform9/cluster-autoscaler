@@ -22,7 +22,7 @@ ARCH ?= amd64
 export DOCKER_CLI_EXPERIMENTAL=enabled
 
 registry_url = docker.io
-image_name = ${registry_url}/platform9/cluster-autoscaler/addon-resizer
+image_name = ${registry_url}/platform9/addon-resizer
 DOCKERFILE?=$(CURDIR)/Dockerfile
 UPSTREAM_VERSION?=$(shell git describe --tags HEAD | sed 's/-.*//' )
 image_tag = $(UPSTREAM_VERSION)-pmk-$(TEAMCITY_BUILD_ID)
