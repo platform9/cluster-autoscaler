@@ -35,6 +35,20 @@ BASEIMAGE?=gcr.io/distroless/static:latest
 
 TEMP_DIR := $(shell mktemp -d)
 
+registry_url = docker.io
+image_name = ${registry_url}/platform9/addon-resizer
+DOCKERFILE?=$(CURDIR)/Dockerfile
+UPSTREAM_VERSION?=$(shell git describe --tags HEAD | sed 's/-.*//' )
+image_tag = $(UPSTREAM_VERSION)-pmk-$(TEAMCITY_BUILD_ID)
+PF9_TAG=$(image_name):${image_tag}
+DOCKERARGS=
+ifdef HTTP_PROXY
+	DOCKERARGS += --build-arg http_proxy=$(HTTP_PROXY)
+endif
+ifdef HTTPS_PROXY
+	DOCKERARGS += --build-arg https_proxy=$(HTTPS_PROXY)
+endif
+
 all: all-container
 
 sub-container-%:
@@ -53,19 +67,20 @@ buildx-setup:
 container: .container-$(ARCH)
 .container-$(ARCH): buildx-setup
 	cp -r * $(TEMP_DIR)
-	cd $(TEMP_DIR) && sed -i 's|BASEIMAGE|$(BASEIMAGE)|g' Dockerfile
+	cd $(TEMP_DIR) && sed -i- 's|BASEIMAGE|$(BASEIMAGE)|g' Dockerfile
 
-	docker run --rm -it -v $(TEMP_DIR):$(TEMP_DIR):Z -v `pwd`:/go/src/k8s.io/autoscaler/addon-resizer/:Z \
+	docker run --rm -v $(TEMP_DIR):$(TEMP_DIR):Z -v `pwd`:/go/src/k8s.io/autoscaler/addon-resizer/:Z \
         golang:${GOLANG_VERSION} \
         /bin/bash -c "\
             cd /go/src/k8s.io/autoscaler/addon-resizer/ && \
             CGO_ENABLED=0 GOARM=$(GOARM) GOARCH=$(ARCH) go build -a -installsuffix cgo --ldflags '-w -X k8s.io/autoscaler/addon-resizer/nanny.AddonResizerVersion=$(TAG)' -o $(TEMP_DIR)/pod_nanny nanny/main/pod_nanny.go"
 
+	$(info Building Docker image for pf9 Repo...)
 	docker buildx build \
 		--pull \
 		--platform linux/$(ARCH) \
 		--output=type=$(OUTPUT_TYPE) \
-		-t $(MULTI_ARCH_IMG):$(TAG) $(TEMP_DIR)
+		-t $(PF9_TAG) $(TEMP_DIR)
 
 test:
 	docker run --rm -it -v `pwd`:/go/src/k8s.io/autoscaler/addon-resizer/:Z \
@@ -87,3 +102,12 @@ clean: $(addprefix sub-clean-,$(ALL_ARCH))
 sub-clean-%:
 	docker rmi -f $(IMAGE)-$*:$(TAG) || true
 
+pf9-image: | $(CURDIR) ; $(info Building Docker image for pf9 Repo...) @ ## Build SR-IOV Network device plugin docker image
+	@docker build -t $(PF9_TAG) -f $(DOCKERFILE)  $(CURDIR) $(DOCKERARGS)
+	echo ${PF9_TAG} > $(CURDIR)/container-tag
+
+pf9-push: 
+	echo ${PF9_TAG} > $(CURDIR)/container-tag
+	docker login
+	docker push $(PF9_TAG)\
+	&& docker rmi $(PF9_TAG)
