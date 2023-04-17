@@ -107,6 +107,7 @@ pf9-image: | $(CURDIR) ; $(info Building Docker image for pf9 Repo...) @ ## Buil
 	echo ${PF9_TAG} > $(CURDIR)/container-tag
 
 pf9-push: 
+	echo ${PF9_TAG} > $(CURDIR)/container-tag
 	docker login
 	docker push $(PF9_TAG)\
 	&& docker rmi $(PF9_TAG)
