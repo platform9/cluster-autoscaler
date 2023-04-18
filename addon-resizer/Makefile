@@ -39,7 +39,7 @@ registry_url = docker.io
 image_name = ${registry_url}/platform9/addon-resizer
 DOCKERFILE?=$(CURDIR)/Dockerfile
 UPSTREAM_VERSION?=$(shell git describe --tags HEAD | sed 's/-.*//' )
-image_tag = $(UPSTREAM_VERSION)-pmk-$(TEAMCITY_BUILD_ID)
+image_tag = v1.8.18-pmk-$(TEAMCITY_BUILD_ID)
 PF9_TAG=$(image_name):${image_tag}
 DOCKERARGS=
 ifdef HTTP_PROXY
