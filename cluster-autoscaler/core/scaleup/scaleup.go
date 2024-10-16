@@ -21,6 +21,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
+	"k8s.io/autoscaler/cluster-autoscaler/estimator"
 	ca_processors "k8s.io/autoscaler/cluster-autoscaler/processors"
 	"k8s.io/autoscaler/cluster-autoscaler/processors/status"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
@@ -36,7 +37,8 @@ type Orchestrator interface {
 		autoscalingContext *context.AutoscalingContext,
 		processors *ca_processors.AutoscalingProcessors,
 		clusterStateRegistry *clusterstate.ClusterStateRegistry,
-		ignoredTaints taints.TaintKeySet,
+		estimatorBuilder estimator.EstimatorBuilder,
+		taintConfig taints.TaintConfig,
 	)
 	// ScaleUp tries to scale the cluster up. Returns appropriate status or error if
 	// an unexpected error occurred. Assumes that all nodes in the cluster are ready
@@ -46,6 +48,7 @@ type Orchestrator interface {
 		nodes []*apiv1.Node,
 		daemonSets []*appsv1.DaemonSet,
 		nodeInfos map[string]*schedulerframework.NodeInfo,
+		allOrNothing bool,
 	) (*status.ScaleUpStatus, errors.AutoscalerError)
 	// ScaleUpToNodeGroupMinSize tries to scale up node groups that have less nodes
 	// than the configured min size. The source of truth for the current node group
