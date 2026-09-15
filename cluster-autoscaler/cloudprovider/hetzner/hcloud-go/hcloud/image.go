@@ -1,36 +1,19 @@
-/*
-Copyright 2018 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package hcloud
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
 	"time"
 
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/hetzner/hcloud-go/hcloud/exp/ctxutil"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/hetzner/hcloud-go/hcloud/schema"
 )
 
 // Image represents an Image in the Hetzner Cloud.
 type Image struct {
-	ID          int
+	ID          int64
 	Name        string
 	Type        ImageType
 	Status      ImageStatus
@@ -42,8 +25,9 @@ type Image struct {
 	BoundTo     *Server
 	RapidDeploy bool
 
-	OSFlavor  string
-	OSVersion string
+	OSFlavor     string
+	OSVersion    string
+	Architecture Architecture
 
 	Protection ImageProtection
 	Deprecated time.Time // The zero value denotes the image is not deprecated.
@@ -51,14 +35,21 @@ type Image struct {
 	Deleted    time.Time
 }
 
+func (o *Image) pathID() (string, error) {
+	if o.ID == 0 {
+		return "", missingField(o, "ID")
+	}
+	return strconv.FormatInt(o.ID, 10), nil
+}
+
 // IsDeprecated returns whether the image is deprecated.
-func (image *Image) IsDeprecated() bool {
-	return !image.Deprecated.IsZero()
+func (o *Image) IsDeprecated() bool {
+	return !o.Deprecated.IsZero()
 }
 
 // IsDeleted returns whether the image is deleted.
-func (image *Image) IsDeleted() bool {
-	return !image.Deleted.IsZero()
+func (o *Image) IsDeleted() bool {
+	return !o.Deleted.IsZero()
 }
 
 // ImageProtection represents the protection level of an image.
@@ -93,45 +84,67 @@ const (
 // ImageClient is a client for the image API.
 type ImageClient struct {
 	client *Client
+	Action *ResourceActionClient[*Image]
 }
 
 // GetByID retrieves an image by its ID. If the image does not exist, nil is returned.
-func (c *ImageClient) GetByID(ctx context.Context, id int) (*Image, *Response, error) {
-	req, err := c.client.NewRequest(ctx, "GET", fmt.Sprintf("/images/%d", id), nil)
-	if err != nil {
-		return nil, nil, err
-	}
+func (c *ImageClient) GetByID(ctx context.Context, id int64) (*Image, *Response, error) {
+	const opPath = "/images/%d"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
 
-	var body schema.ImageGetResponse
-	resp, err := c.client.Do(req, &body)
+	reqPath := fmt.Sprintf(opPath, id)
+
+	respBody, resp, err := getRequest[schema.ImageGetResponse](ctx, c.client, reqPath)
 	if err != nil {
 		if IsError(err, ErrorCodeNotFound) {
 			return nil, resp, nil
 		}
-		return nil, nil, err
+		return nil, resp, err
 	}
-	return ImageFromSchema(body.Image), resp, nil
+
+	return ImageFromSchema(respBody.Image), resp, nil
 }
 
 // GetByName retrieves an image by its name. If the image does not exist, nil is returned.
+//
+// Deprecated: Use [ImageClient.GetByNameAndArchitecture] instead.
 func (c *ImageClient) GetByName(ctx context.Context, name string) (*Image, *Response, error) {
-	if name == "" {
-		return nil, nil, nil
-	}
-	images, response, err := c.List(ctx, ImageListOpts{Name: name})
-	if len(images) == 0 {
-		return nil, response, err
-	}
-	return images[0], response, err
+	return firstByName(name, func() ([]*Image, *Response, error) {
+		return c.List(ctx, ImageListOpts{Name: name})
+	})
+}
+
+// GetByNameAndArchitecture retrieves an image by its name and architecture. If the image does not exist,
+// nil is returned.
+// In contrast to [ImageClient.Get], this method also returns deprecated images. Depending on your needs you should
+// check for this in your calling method.
+func (c *ImageClient) GetByNameAndArchitecture(ctx context.Context, name string, architecture Architecture) (*Image, *Response, error) {
+	return firstByName(name, func() ([]*Image, *Response, error) {
+		return c.List(ctx, ImageListOpts{Name: name, Architecture: []Architecture{architecture}, IncludeDeprecated: true})
+	})
 }
 
 // Get retrieves an image by its ID if the input can be parsed as an integer, otherwise it
 // retrieves an image by its name. If the image does not exist, nil is returned.
+//
+// Deprecated: Use [ImageClient.GetForArchitecture] instead.
 func (c *ImageClient) Get(ctx context.Context, idOrName string) (*Image, *Response, error) {
-	if id, err := strconv.Atoi(idOrName); err == nil {
-		return c.GetByID(ctx, int(id))
-	}
-	return c.GetByName(ctx, idOrName)
+	return getByIDOrName(ctx, c.GetByID, c.GetByName, idOrName)
+}
+
+// GetForArchitecture retrieves an image by its ID if the input can be parsed as an integer, otherwise it
+// retrieves an image by its name and architecture. If the image does not exist, nil is returned.
+//
+// In contrast to [ImageClient.Get], this method also returns deprecated images. Depending on your needs you should
+// check for this in your calling method.
+func (c *ImageClient) GetForArchitecture(ctx context.Context, idOrName string, architecture Architecture) (*Image, *Response, error) {
+	return getByIDOrName(ctx,
+		c.GetByID,
+		func(ctx context.Context, name string) (*Image, *Response, error) {
+			return c.GetByNameAndArchitecture(ctx, name, architecture)
+		},
+		idOrName,
+	)
 }
 
 // ImageListOpts specifies options for listing images.
@@ -143,15 +156,16 @@ type ImageListOpts struct {
 	Sort              []string
 	Status            []ImageStatus
 	IncludeDeprecated bool
+	Architecture      []Architecture
 }
 
 func (l ImageListOpts) values() url.Values {
-	vals := l.ListOpts.values()
+	vals := l.ListOpts.Values()
 	for _, typ := range l.Type {
 		vals.Add("type", string(typ))
 	}
 	if l.BoundTo != nil {
-		vals.Add("bound_to", strconv.Itoa(l.BoundTo.ID))
+		vals.Add("bound_to", strconv.FormatInt(l.BoundTo.ID, 10))
 	}
 	if l.Name != "" {
 		vals.Add("name", l.Name)
@@ -165,6 +179,9 @@ func (l ImageListOpts) values() url.Values {
 	for _, status := range l.Status {
 		vals.Add("status", string(status))
 	}
+	for _, arch := range l.Architecture {
+		vals.Add("architecture", string(arch))
+	}
 	return vals
 }
 
@@ -173,56 +190,43 @@ func (l ImageListOpts) values() url.Values {
 // Please note that filters specified in opts are not taken into account
 // when their value corresponds to their zero value or when they are empty.
 func (c *ImageClient) List(ctx context.Context, opts ImageListOpts) ([]*Image, *Response, error) {
-	path := "/images?" + opts.values().Encode()
-	req, err := c.client.NewRequest(ctx, "GET", path, nil)
+	const opPath = "/images?%s"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	reqPath := fmt.Sprintf(opPath, opts.values().Encode())
+
+	respBody, resp, err := getRequest[schema.ImageListResponse](ctx, c.client, reqPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, resp, err
 	}
 
-	var body schema.ImageListResponse
-	resp, err := c.client.Do(req, &body)
-	if err != nil {
-		return nil, nil, err
-	}
-	images := make([]*Image, 0, len(body.Images))
-	for _, i := range body.Images {
-		images = append(images, ImageFromSchema(i))
-	}
-	return images, resp, nil
+	return allFromSchemaFunc(respBody.Images, ImageFromSchema), resp, nil
 }
 
 // All returns all images.
 func (c *ImageClient) All(ctx context.Context) ([]*Image, error) {
-	return c.AllWithOpts(ctx, ImageListOpts{ListOpts: ListOpts{PerPage: 50}})
+	return c.AllWithOpts(ctx, ImageListOpts{})
 }
 
 // AllWithOpts returns all images for the given options.
 func (c *ImageClient) AllWithOpts(ctx context.Context, opts ImageListOpts) ([]*Image, error) {
-	allImages := []*Image{}
-
-	err := c.client.all(func(page int) (*Response, error) {
-		opts.Page = page
-		images, resp, err := c.List(ctx, opts)
-		if err != nil {
-			return resp, err
-		}
-		allImages = append(allImages, images...)
-		return resp, nil
-	})
-	if err != nil {
-		return nil, err
+	if opts.ListOpts.PerPage == 0 {
+		opts.ListOpts.PerPage = 50
 	}
-
-	return allImages, nil
+	return iterPages(func(page int) ([]*Image, *Response, error) {
+		opts.Page = page
+		return c.List(ctx, opts)
+	})
 }
 
 // Delete deletes an image.
 func (c *ImageClient) Delete(ctx context.Context, image *Image) (*Response, error) {
-	req, err := c.client.NewRequest(ctx, "DELETE", fmt.Sprintf("/images/%d", image.ID), nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.client.Do(req, nil)
+	const opPath = "/images/%d"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	reqPath := fmt.Sprintf(opPath, image.ID)
+
+	return deleteRequestNoResult(ctx, c.client, reqPath)
 }
 
 // ImageUpdateOpts specifies options for updating an image.
@@ -234,31 +238,26 @@ type ImageUpdateOpts struct {
 
 // Update updates an image.
 func (c *ImageClient) Update(ctx context.Context, image *Image, opts ImageUpdateOpts) (*Image, *Response, error) {
+	const opPath = "/images/%d"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	reqPath := fmt.Sprintf(opPath, image.ID)
+
 	reqBody := schema.ImageUpdateRequest{
 		Description: opts.Description,
 	}
 	if opts.Type != "" {
-		reqBody.Type = String(string(opts.Type))
+		reqBody.Type = Ptr(string(opts.Type))
 	}
 	if opts.Labels != nil {
 		reqBody.Labels = &opts.Labels
 	}
-	reqBodyData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, nil, err
-	}
 
-	path := fmt.Sprintf("/images/%d", image.ID)
-	req, err := c.client.NewRequest(ctx, "PUT", path, bytes.NewReader(reqBodyData))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	respBody := schema.ImageUpdateResponse{}
-	resp, err := c.client.Do(req, &respBody)
+	respBody, resp, err := putRequest[schema.ImageUpdateResponse](ctx, c.client, reqPath, reqBody)
 	if err != nil {
 		return nil, resp, err
 	}
+
 	return ImageFromSchema(respBody.Image), resp, nil
 }
 
@@ -269,24 +268,19 @@ type ImageChangeProtectionOpts struct {
 
 // ChangeProtection changes the resource protection level of an image.
 func (c *ImageClient) ChangeProtection(ctx context.Context, image *Image, opts ImageChangeProtectionOpts) (*Action, *Response, error) {
+	const opPath = "/images/%d/actions/change_protection"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	reqPath := fmt.Sprintf(opPath, image.ID)
+
 	reqBody := schema.ImageActionChangeProtectionRequest{
 		Delete: opts.Delete,
 	}
-	reqBodyData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, nil, err
-	}
 
-	path := fmt.Sprintf("/images/%d/actions/change_protection", image.ID)
-	req, err := c.client.NewRequest(ctx, "POST", path, bytes.NewReader(reqBodyData))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	respBody := schema.ImageActionChangeProtectionResponse{}
-	resp, err := c.client.Do(req, &respBody)
+	respBody, resp, err := postRequest[schema.ImageActionChangeProtectionResponse](ctx, c.client, reqPath, reqBody)
 	if err != nil {
 		return nil, resp, err
 	}
-	return ActionFromSchema(respBody.Action), resp, err
+
+	return ActionFromSchema(respBody.Action), resp, nil
 }

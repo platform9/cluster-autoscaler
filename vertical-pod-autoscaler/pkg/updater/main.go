@@ -18,105 +18,258 @@ package main
 
 import (
 	"context"
-	"flag"
+	"fmt"
 	"os"
+	"os/signal"
+	"reflect"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
-	apiv1 "k8s.io/api/core/v1"
+	"github.com/spf13/pflag"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/informers"
+	kube_client "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	componentbaseconfig "k8s.io/component-base/config"
+	componentbaseoptions "k8s.io/component-base/config/options"
+	"k8s.io/klog/v2"
+
 	"k8s.io/autoscaler/vertical-pod-autoscaler/common"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/patch"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/recommendation"
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
+	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
+	updater_config "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/config"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/inplace"
 	updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/priority"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/client"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics"
 	metrics_updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/updater"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/server"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/status"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
-	"k8s.io/client-go/informers"
-	kube_client "k8s.io/client-go/kubernetes"
-	kube_flag "k8s.io/component-base/cli/flag"
-	"k8s.io/klog/v2"
 )
 
-var (
-	updaterInterval = flag.Duration("updater-interval", 1*time.Minute,
-		`How often updater should run`)
-
-	minReplicas = flag.Int("min-replicas", 2,
-		`Minimum number of replicas to perform update`)
-
-	evictionToleranceFraction = flag.Float64("eviction-tolerance", 0.5,
-		`Fraction of replica count that can be evicted for update, if more than one pod can be evicted.`)
-
-	evictionRateLimit = flag.Float64("eviction-rate-limit", -1,
-		`Number of pods that can be evicted per seconds. A rate limit set to 0 or -1 will disable
-		the rate limiter.`)
-
-	evictionRateBurst = flag.Int("eviction-rate-burst", 1, `Burst of pods that can be evicted.`)
-
-	address      = flag.String("address", ":8943", "The address to expose Prometheus metrics.")
-	kubeconfig   = flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
-	kubeApiQps   = flag.Float64("kube-api-qps", 5.0, `QPS limit when making requests to Kubernetes apiserver`)
-	kubeApiBurst = flag.Float64("kube-api-burst", 10.0, `QPS burst limit when making requests to Kubernetes apiserver`)
-
-	useAdmissionControllerStatus = flag.Bool("use-admission-controller-status", true,
-		"If true, updater will only evict pods when admission controller status is valid.")
-
-	namespace          = os.Getenv("NAMESPACE")
-	vpaObjectNamespace = flag.String("vpa-object-namespace", apiv1.NamespaceAll, "Namespace to search for VPA objects. Empty means all namespaces will be used.")
+const (
+	defaultResyncPeriod          time.Duration = 10 * time.Minute
+	scaleCacheEntryLifetime      time.Duration = time.Hour
+	scaleCacheEntryFreshnessTime time.Duration = 10 * time.Minute
+	scaleCacheEntryJitterFactor  float64       = 1.
 )
 
-const defaultResyncPeriod time.Duration = 10 * time.Minute
+var config *updater_config.UpdaterConfig
 
 func main() {
-	klog.InitFlags(nil)
-	kube_flag.InitFlags()
-	klog.V(1).Infof("Vertical Pod Autoscaler %s Updater", common.VerticalPodAutoscalerVersion)
+	// Leader election needs to be initialized before any other flag, because it may be used in other flag's validation.
+	leaderElection := defaultLeaderElectionConfiguration()
+	componentbaseoptions.BindLeaderElectionFlags(&leaderElection, pflag.CommandLine)
 
-	healthCheck := metrics.NewHealthCheck(*updaterInterval*5, true)
-	metrics.Initialize(*address, healthCheck)
+	config = updater_config.InitUpdaterFlags()
+
+	klog.V(1).InfoS("Vertical Pod Autoscaler Updater", "version", common.VerticalPodAutoscalerVersion())
+
+	healthCheck := metrics.NewHealthCheck(config.UpdaterInterval * 5)
+	server.Initialize(&config.CommonFlags.EnableProfiling, healthCheck, &config.Address)
+
 	metrics_updater.Register()
 
-	config := common.CreateKubeConfigOrDie(*kubeconfig, float32(*kubeApiQps), int(*kubeApiBurst))
-	kubeClient := kube_client.NewForConfigOrDie(config)
-	vpaClient := vpa_clientset.NewForConfigOrDie(config)
-	factory := informers.NewSharedInformerFactory(kubeClient, defaultResyncPeriod)
-	targetSelectorFetcher := target.NewVpaTargetSelectorFetcher(config, kubeClient, factory)
+	if !leaderElection.LeaderElect {
+		run(healthCheck, config.CommonFlags)
+	} else {
+		id, err := os.Hostname()
+		if err != nil {
+			klog.ErrorS(err, "Unable to get hostname")
+			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+		}
+		id = id + "_" + string(uuid.NewUUID())
+
+		kubeConfig := common.CreateKubeConfigOrDie(config.CommonFlags.KubeConfig, float32(config.CommonFlags.KubeApiQps), int(config.CommonFlags.KubeApiBurst))
+		kubeClient := kube_client.NewForConfigOrDie(kubeConfig)
+
+		lock, err := resourcelock.New(
+			leaderElection.ResourceLock,
+			leaderElection.ResourceNamespace,
+			leaderElection.ResourceName,
+			kubeClient.CoreV1(),
+			kubeClient.CoordinationV1(),
+			resourcelock.ResourceLockConfig{
+				Identity: id,
+			},
+		)
+		if err != nil {
+			klog.ErrorS(err, "Unable to create leader election lock")
+			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+		}
+
+		leaderelection.RunOrDie(context.TODO(), leaderelection.LeaderElectionConfig{
+			Lock:            lock,
+			LeaseDuration:   leaderElection.LeaseDuration.Duration,
+			RenewDeadline:   leaderElection.RenewDeadline.Duration,
+			RetryPeriod:     leaderElection.RetryPeriod.Duration,
+			ReleaseOnCancel: true,
+			Callbacks: leaderelection.LeaderCallbacks{
+				OnStartedLeading: func(_ context.Context) {
+					run(healthCheck, config.CommonFlags)
+				},
+				OnStoppedLeading: func() {
+					klog.Fatal("lost master")
+				},
+			},
+		})
+	}
+}
+
+const (
+	defaultLeaseDuration = 15 * time.Second
+	defaultRenewDeadline = 10 * time.Second
+	defaultRetryPeriod   = 2 * time.Second
+)
+
+func defaultLeaderElectionConfiguration() componentbaseconfig.LeaderElectionConfiguration {
+	return componentbaseconfig.LeaderElectionConfiguration{
+		LeaderElect:       false,
+		LeaseDuration:     metav1.Duration{Duration: defaultLeaseDuration},
+		RenewDeadline:     metav1.Duration{Duration: defaultRenewDeadline},
+		RetryPeriod:       metav1.Duration{Duration: defaultRetryPeriod},
+		ResourceLock:      resourcelock.LeasesResourceLock,
+		ResourceName:      "vpa-updater",
+		ResourceNamespace: metav1.NamespaceSystem,
+	}
+}
+
+func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	kubeConfig := common.CreateKubeConfigOrDie(commonFlag.KubeConfig, float32(commonFlag.KubeApiQps), int(commonFlag.KubeApiBurst))
+	kubeClient := kube_client.NewForConfigOrDie(kubeConfig)
+	vpaClient := vpa_clientset.NewForConfigOrDie(kubeConfig)
+	kubeFactory := informers.NewSharedInformerFactoryWithOptions(kubeClient, defaultResyncPeriod,
+		informers.WithNamespace(commonFlag.VpaObjectNamespace),
+		informers.WithTransform(client.StripManagedFields),
+	)
+
+	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(kubeClient, defaultResyncPeriod,
+		informers.WithNamespace(commonFlag.VpaObjectNamespace),
+		informers.WithTransform(client.StripManagedFields),
+		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+			// Filter out unscheduled pods and pods in terminal phases (Succeeded/Failed)
+			opts.FieldSelector = "spec.nodeName!=" + "" + ",status.phase!=" +
+				string(corev1.PodSucceeded) + ",status.phase!=" + string(corev1.PodFailed)
+		}),
+	)
+	targetSelectorFetcher := target.NewVpaTargetSelectorFetcher(kubeConfig, kubeClient, kubeFactory, stopCh)
+	controllerFetcher := controllerfetcher.NewControllerFetcher(kubeConfig, kubeClient, kubeFactory, scaleCacheEntryFreshnessTime, scaleCacheEntryLifetime, scaleCacheEntryJitterFactor, stopCh)
 	var limitRangeCalculator limitrange.LimitRangeCalculator
-	limitRangeCalculator, err := limitrange.NewLimitsRangeCalculator(factory)
+	limitRangeCalculator, err := limitrange.NewLimitsRangeCalculator(kubeFactory)
 	if err != nil {
-		klog.Errorf("Failed to create limitRangeCalculator, falling back to not checking limits. Error message: %s", err)
+		klog.ErrorS(err, "Failed to create limitRangeCalculator, falling back to not checking limits")
 		limitRangeCalculator = limitrange.NewNoopLimitsCalculator()
 	}
+
 	admissionControllerStatusNamespace := status.AdmissionControllerStatusNamespace
-	if namespace != "" {
-		admissionControllerStatusNamespace = namespace
+	if config.Namespace != "" {
+		admissionControllerStatusNamespace = config.Namespace
 	}
-	// TODO: use SharedInformerFactory in updater
+	if config.AdmissionControllerStatusLeaseNamespace != "" {
+		admissionControllerStatusNamespace = config.AdmissionControllerStatusLeaseNamespace
+	}
+
+	ignoredNamespaces := strings.Split(commonFlag.IgnoredVpaObjectNamespaces, ",")
+
+	recommendationProvider := recommendation.NewProvider(limitRangeCalculator, vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalculator))
+
+	calculators := []patch.Calculator{inplace.NewResourceInPlaceUpdatesCalculator(recommendationProvider), inplace.NewInPlaceUpdatedCalculator(), inplace.NewUnboostAnnotationCalculator()}
+
 	updater, err := updater.NewUpdater(
 		kubeClient,
 		vpaClient,
-		*minReplicas,
-		*evictionRateLimit,
-		*evictionRateBurst,
-		*evictionToleranceFraction,
-		*useAdmissionControllerStatus,
+		kubeFactory,
+		podInformerFactory,
+		config.MinReplicas,
+		config.EvictionRateLimit,
+		config.EvictionRateBurst,
+		config.EvictionToleranceFraction,
+		config.UseAdmissionControllerStatus,
+		config.InPlaceSkipDisruptionBudget,
+		config.DefaultUpdateThreshold,
+		config.PodLifetimeUpdateThreshold,
+		config.EvictAfterOOMThreshold,
+		config.AdmissionControllerStatusLeaseName,
 		admissionControllerStatusNamespace,
+		config.AdmissionControllerStatusLeaseTimeout,
 		vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalculator),
-		nil,
+		priority.NewScalingDirectionPodEvictionAdmission(),
 		targetSelectorFetcher,
+		controllerFetcher,
 		priority.NewProcessor(),
-		*vpaObjectNamespace,
+		commonFlag.VpaObjectNamespace,
+		ignoredNamespaces,
+		calculators,
 	)
 	if err != nil {
-		klog.Fatalf("Failed to create updater: %v", err)
+		klog.ErrorS(err, "Failed to create updater")
+		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
-	ticker := time.Tick(*updaterInterval)
-	for range ticker {
-		ctx, cancel := context.WithTimeout(context.Background(), *updaterInterval)
-		updater.RunOnce(ctx)
-		healthCheck.UpdateLastActivity()
-		cancel()
+
+	kubeFactory.Start(stopCh)
+	podInformerFactory.Start(stopCh)
+	for _, informerMap := range []map[reflect.Type]bool{
+		kubeFactory.WaitForCacheSync(stopCh),
+		podInformerFactory.WaitForCacheSync(stopCh),
+	} {
+		for kind, synced := range informerMap {
+			if !synced {
+				klog.ErrorS(nil, fmt.Sprintf("Could not sync cache for the %s informer", kind.String()))
+				klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+			}
+		}
+	}
+
+	// Start boost worker only if CPUStartupBoost feature gate are enabled
+	if features.Enabled(features.CPUStartupBoost) {
+		var wg sync.WaitGroup
+		ctx, cancel := context.WithCancel(sigCtx)
+		defer func() {
+			cancel()
+			updater.ShutDown()
+			wg.Wait()
+		}()
+		for i := 0; i < config.ConcurrentCPUStartupBoostSyncs; i++ {
+			wg.Go(func() {
+				wait.UntilWithContext(ctx, updater.RunBoostWorker, time.Second)
+			})
+		}
+	}
+
+	// Start updating health check endpoint.
+	healthCheck.StartMonitoring()
+
+	ticker := time.NewTicker(config.UpdaterInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			loopCtx, loopCancel := context.WithTimeout(sigCtx, config.UpdaterInterval)
+			updater.RunOnce(loopCtx)
+			healthCheck.UpdateLastActivity()
+			loopCancel()
+		case <-sigCtx.Done():
+			klog.InfoS("Received shutdown signal, exiting")
+			return
+		}
 	}
 }

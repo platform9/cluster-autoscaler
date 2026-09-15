@@ -19,16 +19,17 @@ package alicloud
 import (
 	"errors"
 	"fmt"
-	"gopkg.in/gcfg.v1"
 	"io"
+	"math/rand"
+	"time"
+
+	"gopkg.in/gcfg.v1"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/alicloud/alibaba-cloud-sdk-go/services/ess"
 	klog "k8s.io/klog/v2"
-	"math/rand"
-	"time"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 )
 
 const (
@@ -107,12 +108,15 @@ func (m *AliCloudManager) GetAsgSize(asgConfig *Asg) (int64, error) {
 	if err != nil {
 		return -1, fmt.Errorf("failed to describe ASG %s,Because of %s", asgConfig.id, err.Error())
 	}
-	return int64(sg.ActiveCapacity + sg.PendingCapacity), nil
+	if sg.EnableDesiredCapacity {
+		return int64(sg.DesiredCapacity), nil
+	}
+	return int64(sg.ActiveCapacity + sg.PendingCapacity + sg.InitCapacity), nil
 }
 
 // SetAsgSize sets ASG size.
 func (m *AliCloudManager) SetAsgSize(asg *Asg, size int64) error {
-	return m.aService.setCapcityInstanceSize(asg.id, size)
+	return m.aService.setCapacityInstanceSize(asg.id, size)
 }
 
 // DeleteInstances deletes the given instances. All instances must be controlled by the same ASG.

@@ -17,43 +17,62 @@ limitations under the License.
 package civo
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	civocloud "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/civo/civo-cloud-sdk-go"
 
 	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	autoscaler "k8s.io/autoscaler/cluster-autoscaler/config"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	autoscaler "sigs.k8s.io/cluster-autoscaler/pkg/config"
+	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/gpu"
 )
 
 // NodeGroup implements cloudprovider.NodeGroup interface. NodeGroup contains
 // configuration info and functions to control a set of nodes that have the
 // same capacity and set of labels.
 type NodeGroup struct {
-	id         string
-	clusterID  string
-	client     nodeGroupClient
-	nodePool   *civocloud.KubernetesPool
-	minSize    int
-	maxSize    int
-	getOptions *autoscaler.NodeGroupAutoscalingOptions
+	id           string
+	clusterID    string
+	client       nodeGroupClient
+	nodePool     *civocloud.KubernetesPool
+	minSize      int
+	maxSize      int
+	getOptions   *autoscaler.NodeGroupAutoscalingOptions
+	nodeTemplate *CivoNodeTemplate
+}
+
+// CivoNodeTemplate reference to implements TemplateNodeInfo
+type CivoNodeTemplate struct {
+	// Size represents the pool size of civocloud
+	Size          string            `json:"size,omitempty"`
+	CPUCores      int               `json:"cpu_cores,omitempty"`
+	RAMMegabytes  int               `json:"ram_mb,omitempty"`
+	DiskGigabytes int               `json:"disk_gb,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Taints        []apiv1.Taint     `json:"taint,omitempty"`
+	GpuCount      int               `json:"gpu_count,omitempty"`
+	Region        string            `json:"region,omitempty"`
 }
 
 // MaxSize returns maximum size of the node group.
-func (n *NodeGroup) MaxSize() int {
+func (n *NodeGroup) MaxSize(ctx context.Context) int {
 	return n.maxSize
 }
 
 // MinSize returns minimum size of the node group.
-func (n *NodeGroup) MinSize() int {
+func (n *NodeGroup) MinSize(ctx context.Context) int {
 	return n.minSize
 }
 
 // GetOptions returns the options used to create this node group.
-func (n *NodeGroup) GetOptions(autoscaler.NodeGroupAutoscalingOptions) (*autoscaler.NodeGroupAutoscalingOptions, error) {
+func (n *NodeGroup) GetOptions(context.Context, autoscaler.NodeGroupAutoscalingOptions) (*autoscaler.NodeGroupAutoscalingOptions, error) {
 	return n.getOptions, nil
 }
 
@@ -62,23 +81,23 @@ func (n *NodeGroup) GetOptions(autoscaler.NodeGroupAutoscalingOptions) (*autosca
 // be equal to Size() once everything stabilizes (new nodes finish startup and
 // registration or removed nodes are deleted completely). Implementation
 // required.
-func (n *NodeGroup) TargetSize() (int, error) {
+func (n *NodeGroup) TargetSize(ctx context.Context) (int, error) {
 	return n.nodePool.Count, nil
 }
 
 // IncreaseSize increases the size of the node group. To delete a node you need
 // to explicitly name it and use DeleteNode. This function should wait until
 // node group size is updated. Implementation required.
-func (n *NodeGroup) IncreaseSize(delta int) error {
+func (n *NodeGroup) IncreaseSize(ctx context.Context, delta int) error {
 	if delta <= 0 {
 		return fmt.Errorf("delta must be positive, have: %d", delta)
 	}
 
 	targetSize := n.nodePool.Count + delta
 
-	if targetSize > n.MaxSize() {
+	if targetSize > n.MaxSize(context.TODO()) {
 		return fmt.Errorf("size increase is too large. current: %d desired: %d max: %d",
-			n.nodePool.Count, targetSize, n.MaxSize())
+			n.nodePool.Count, targetSize, n.MaxSize(context.TODO()))
 	}
 
 	req := &civocloud.KubernetesClusterPoolUpdateConfig{
@@ -90,9 +109,9 @@ func (n *NodeGroup) IncreaseSize(delta int) error {
 		return err
 	}
 
-	if updatedNodePool.Count != targetSize {
-		return fmt.Errorf("couldn't increase size to %d (delta: %d). Current size is: %d",
-			targetSize, delta, updatedNodePool.Count)
+	if targetSize > n.MaxSize(context.TODO()) {
+		return fmt.Errorf("size increase too large. current: %d, desired: %d, max: %d",
+			updatedNodePool.Count, targetSize, n.MaxSize(context.TODO()))
 	}
 
 	// update internal cache
@@ -100,14 +119,19 @@ func (n *NodeGroup) IncreaseSize(delta int) error {
 	return nil
 }
 
+// AtomicIncreaseSize is not implemented.
+func (n *NodeGroup) AtomicIncreaseSize(ctx context.Context, delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DeleteNodes deletes nodes from this node group (and also increasing the size
 // of the node group with that). Error is returned either on failure or if the
 // given node doesn't belong to this node group. This function should wait
 // until node group size is updated. Implementation required.
-func (n *NodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
+func (n *NodeGroup) DeleteNodes(ctx context.Context, nodes []*apiv1.Node) error {
 	for _, node := range nodes {
 		instanceID := toNodeID(node.Spec.ProviderID)
-		klog.V(4).Info("deleteing node: %q", instanceID)
+		klog.V(4).Infof("deleteing node: %q", instanceID)
 		_, err := n.client.DeleteKubernetesClusterPoolInstance(n.clusterID, n.id, instanceID)
 		if err != nil {
 			return fmt.Errorf("deleting node failed for cluster: %q node pool: %q node: %q: %s",
@@ -121,20 +145,25 @@ func (n *NodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	return nil
 }
 
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (n *NodeGroup) ForceDeleteNodes(ctx context.Context, nodes []*apiv1.Node) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DecreaseTargetSize decreases the target size of the node group. This function
 // doesn't permit to delete any existing node and can be used only to reduce the
 // request for new nodes that have not been yet fulfilled. Delta should be negative.
 // It is assumed that cloud provider will not delete the existing nodes when there
 // is an option to just decrease the target. Implementation required.
-func (n *NodeGroup) DecreaseTargetSize(delta int) error {
+func (n *NodeGroup) DecreaseTargetSize(ctx context.Context, delta int) error {
 	if delta >= 0 {
 		return fmt.Errorf("delta must be negative, have: %d", delta)
 	}
 
 	targetSize := n.nodePool.Count + delta
-	if targetSize < n.MinSize() {
+	if targetSize < n.MinSize(context.TODO()) {
 		return fmt.Errorf("size decrease is too small. current: %d desired: %d min: %d",
-			n.nodePool.Count, targetSize, n.MinSize())
+			n.nodePool.Count, targetSize, n.MinSize(context.TODO()))
 	}
 
 	req := &civocloud.KubernetesClusterPoolUpdateConfig{
@@ -163,14 +192,14 @@ func (n *NodeGroup) Id() string {
 }
 
 // Debug returns a string containing all information regarding this node group.
-func (n *NodeGroup) Debug() string {
-	return fmt.Sprintf("cluster ID: %s (min:%d max:%d)", n.Id(), n.MinSize(), n.MaxSize())
+func (n *NodeGroup) Debug(ctx context.Context) string {
+	return fmt.Sprintf("id: %s (min:%d max:%d)", n.Id(), n.MinSize(context.TODO()), n.MaxSize(context.TODO()))
 }
 
 // Nodes returns a list of all nodes that belong to this node group.  It is
 // required that Instance objects returned by this method have Id field set.
 // Other fields are optional.
-func (n *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
+func (n *NodeGroup) Nodes(ctx context.Context) ([]cloudprovider.Instance, error) {
 	if n.nodePool == nil {
 		return nil, errors.New("node pool instance is not created")
 	}
@@ -185,33 +214,39 @@ func (n *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 // all of the labels, capacity and allocatable information as well as all pods
 // that are started on the node by default, using manifest (most likely only
 // kube-proxy). Implementation optional.
-func (n *NodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
-	return nil, cloudprovider.ErrNotImplemented
+func (n *NodeGroup) TemplateNodeInfo(ctx context.Context) (*framework.NodeInfo, error) {
+	node, err := n.buildNodeFromTemplate(n.Id(), n.nodeTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build node from template")
+	}
+
+	nodeInfo := framework.NewNodeInfo(node, nil, framework.NewPodInfo(cloudprovider.BuildKubeProxy(n.Id()), nil))
+	return nodeInfo, nil
 }
 
 // Exist checks if the node group really exists on the cloud provider side.
 // Allows to tell the theoretical node group from the real one. Implementation
 // required.
-func (n *NodeGroup) Exist() bool {
+func (n *NodeGroup) Exist(ctx context.Context) bool {
 	return n.nodePool != nil
 }
 
 // Create creates the node group on the cloud provider side. Implementation
 // optional.
-func (n *NodeGroup) Create() (cloudprovider.NodeGroup, error) {
+func (n *NodeGroup) Create(ctx context.Context) (cloudprovider.NodeGroup, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // Delete deletes the node group on the cloud provider side.  This will be
 // executed only for autoprovisioned node groups, once their size drops to 0.
 // Implementation optional.
-func (n *NodeGroup) Delete() error {
+func (n *NodeGroup) Delete(ctx context.Context) error {
 	return cloudprovider.ErrNotImplemented
 }
 
 // Autoprovisioned returns true if the node group is autoprovisioned. An
 // autoprovisioned group was created by CA and can be deleted when scaled to 0.
-func (n *NodeGroup) Autoprovisioned() bool {
+func (n *NodeGroup) Autoprovisioned(ctx context.Context) bool {
 	return false
 }
 
@@ -258,4 +293,58 @@ func toInstanceStatus(nodeState string) *cloudprovider.InstanceStatus {
 	}
 
 	return st
+}
+
+// buildNodeFromTemplate returns a Node object from the given template
+func (n *NodeGroup) buildNodeFromTemplate(name string, template *CivoNodeTemplate) (*apiv1.Node, error) {
+	node := &apiv1.Node{}
+	nodeName := fmt.Sprintf("%s-nodegroup-%d", name, rand.Int63())
+
+	node.ObjectMeta = metav1.ObjectMeta{
+		Name:     nodeName,
+		SelfLink: fmt.Sprintf("/api/v1/nodes/%s", nodeName),
+		Labels:   map[string]string{},
+	}
+
+	node.Status = apiv1.NodeStatus{
+		Capacity: apiv1.ResourceList{},
+	}
+	node.Status.Capacity[apiv1.ResourcePods] = *resource.NewQuantity(110, resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewQuantity(int64(template.CPUCores*1000), resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(int64(template.RAMMegabytes*1024*1024), resource.DecimalSI)
+	node.Status.Capacity[apiv1.ResourceEphemeralStorage] = *resource.NewQuantity(int64(template.DiskGigabytes*1024*1024*1024), resource.DecimalSI)
+	node.Status.Capacity[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(int64(template.GpuCount), resource.DecimalSI)
+
+	node.Status.Allocatable = node.Status.Capacity
+
+	// GenericLabels and NodeLabels
+	node.Labels = cloudprovider.JoinStringMaps(node.Labels, buildLabels(template, nodeName))
+
+	_, ok := node.Labels["kubernetes.civo.com/civo-node-pool"]
+	if !ok {
+		node.Labels["kubernetes.civo.com/civo-node-pool"] = n.Id()
+	}
+
+	node.Spec.Taints = template.Taints
+
+	node.Status.Conditions = cloudprovider.BuildReadyConditions()
+
+	return node, nil
+}
+
+func buildLabels(template *CivoNodeTemplate, nodeName string) map[string]string {
+	result := make(map[string]string)
+
+	// NodeLabels
+	for key, value := range template.Labels {
+		result[key] = value
+	}
+
+	// GenericLabels
+	result[apiv1.LabelOSStable] = cloudprovider.DefaultOS
+	result[apiv1.LabelInstanceTypeStable] = template.Size
+	result[apiv1.LabelTopologyRegion] = template.Region
+	result[apiv1.LabelHostname] = nodeName
+
+	return result
 }

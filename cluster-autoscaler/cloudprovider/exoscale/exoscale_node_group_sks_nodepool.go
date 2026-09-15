@@ -22,10 +22,14 @@ import (
 	"sync"
 
 	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	egoscale "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/exoscale/internal/github.com/exoscale/egoscale/v2"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/config"
+	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
+)
+
+const (
+	scaleToZeroSupported = false
 )
 
 // sksNodepoolNodeGroup implements cloudprovider.NodeGroup interface for Exoscale SKS Nodepools.
@@ -36,44 +40,42 @@ type sksNodepoolNodeGroup struct {
 	m *Manager
 
 	sync.Mutex
+
+	minSize int
+	maxSize int
 }
 
 // MaxSize returns maximum size of the node group.
-func (n *sksNodepoolNodeGroup) MaxSize() int {
-	limit, err := n.m.computeInstanceQuota()
-	if err != nil {
-		return 0
-	}
-
-	return limit
+func (n *sksNodepoolNodeGroup) MaxSize(ctx context.Context) int {
+	return n.maxSize
 }
 
 // MinSize returns minimum size of the node group.
-func (n *sksNodepoolNodeGroup) MinSize() int {
-	return 1
+func (n *sksNodepoolNodeGroup) MinSize(ctx context.Context) int {
+	return n.minSize
 }
 
 // TargetSize returns the current target size of the node group. It is possible that the
 // number of nodes in Kubernetes is different at the moment but should be equal
 // to Size() once everything stabilizes (new nodes finish startup and registration or
 // removed nodes are deleted completely). Implementation required.
-func (n *sksNodepoolNodeGroup) TargetSize() (int, error) {
+func (n *sksNodepoolNodeGroup) TargetSize(ctx context.Context) (int, error) {
 	return int(*n.sksNodepool.Size), nil
 }
 
 // IncreaseSize increases the size of the node group. To delete a node you need
 // to explicitly name it and use DeleteNode. This function should wait until
 // node group size is updated. Implementation required.
-func (n *sksNodepoolNodeGroup) IncreaseSize(delta int) error {
+func (n *sksNodepoolNodeGroup) IncreaseSize(ctx context.Context, delta int) error {
 	if delta <= 0 {
 		return fmt.Errorf("delta must be positive, have: %d", delta)
 	}
 
 	targetSize := *n.sksNodepool.Size + int64(delta)
 
-	if targetSize > int64(n.MaxSize()) {
+	if targetSize > int64(n.MaxSize(context.TODO())) {
 		return fmt.Errorf("size increase is too large (current: %d desired: %d max: %d)",
-			*n.sksNodepool.Size, targetSize, n.MaxSize())
+			*n.sksNodepool.Size, targetSize, n.MaxSize(context.TODO()))
 	}
 
 	infof("scaling SKS Nodepool %s to size %d", *n.sksNodepool.ID, targetSize)
@@ -92,10 +94,15 @@ func (n *sksNodepoolNodeGroup) IncreaseSize(delta int) error {
 	return nil
 }
 
+// AtomicIncreaseSize is not implemented.
+func (n *sksNodepoolNodeGroup) AtomicIncreaseSize(ctx context.Context, delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DeleteNodes deletes nodes from this node group. Error is returned either on
 // failure or if the given node doesn't belong to this node group. This function
 // should wait until node group size is updated. Implementation required.
-func (n *sksNodepoolNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
+func (n *sksNodepoolNodeGroup) DeleteNodes(ctx context.Context, nodes []*apiv1.Node) error {
 	n.Lock()
 	defer n.Unlock()
 
@@ -131,12 +138,17 @@ func (n *sksNodepoolNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	return nil
 }
 
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (n *sksNodepoolNodeGroup) ForceDeleteNodes(ctx context.Context, nodes []*apiv1.Node) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DecreaseTargetSize decreases the target size of the node group. This function
 // doesn't permit to delete any existing node and can be used only to reduce the
 // request for new nodes that have not been yet fulfilled. Delta should be negative.
 // It is assumed that cloud provider will not delete the existing nodes when there
 // is an option to just decrease the target. Implementation required.
-func (n *sksNodepoolNodeGroup) DecreaseTargetSize(_ int) error {
+func (n *sksNodepoolNodeGroup) DecreaseTargetSize(ctx context.Context, _ int) error {
 	// Exoscale Instance Pools don't support down-sizing without deleting members,
 	// so it is not possible to implement it according to the documented behavior.
 	return nil
@@ -148,15 +160,15 @@ func (n *sksNodepoolNodeGroup) Id() string {
 }
 
 // Debug returns a string containing all information regarding this node group.
-func (n *sksNodepoolNodeGroup) Debug() string {
-	return fmt.Sprintf("Node group ID: %s (min:%d max:%d)", n.Id(), n.MinSize(), n.MaxSize())
+func (n *sksNodepoolNodeGroup) Debug(ctx context.Context) string {
+	return fmt.Sprintf("Node group ID: %s (min:%d max:%d)", n.Id(), n.MinSize(context.TODO()), n.MaxSize(context.TODO()))
 }
 
 // Nodes returns a list of all nodes that belong to this node group.
 // It is required that Instance objects returned by this method have Id field set.
 // Other fields are optional.
 // This list should include also instances that might have not become a kubernetes node yet.
-func (n *sksNodepoolNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
+func (n *sksNodepoolNodeGroup) Nodes(ctx context.Context) ([]cloudprovider.Instance, error) {
 	instancePool, err := n.m.client.GetInstancePool(n.m.ctx, n.m.zone, *n.sksNodepool.InstancePoolID)
 	if err != nil {
 		errorf(
@@ -180,43 +192,43 @@ func (n *sksNodepoolNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 	return nodes, nil
 }
 
-// TemplateNodeInfo returns a schedulerframework.NodeInfo structure of an empty
+// TemplateNodeInfo returns a framework.NodeInfo structure of an empty
 // (as if just started) node. This will be used in scale-up simulations to
 // predict what would a new node look like if a node group was expanded. The returned
 // NodeInfo is expected to have a fully populated Node object, with all of the labels,
 // capacity and allocatable information as well as all pods that are started on
 // the node by default, using manifest (most likely only kube-proxy). Implementation optional.
-func (n *sksNodepoolNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (n *sksNodepoolNodeGroup) TemplateNodeInfo(ctx context.Context) (*framework.NodeInfo, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // Exist checks if the node group really exists on the cloud provider side. Allows to tell the
 // theoretical node group from the real one. Implementation required.
-func (n *sksNodepoolNodeGroup) Exist() bool {
+func (n *sksNodepoolNodeGroup) Exist(ctx context.Context) bool {
 	return n.sksNodepool != nil
 }
 
 // Create creates the node group on the cloud provider side. Implementation optional.
-func (n *sksNodepoolNodeGroup) Create() (cloudprovider.NodeGroup, error) {
+func (n *sksNodepoolNodeGroup) Create(ctx context.Context) (cloudprovider.NodeGroup, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // Delete deletes the node group on the cloud provider side.
 // This will be executed only for autoprovisioned node groups, once their size drops to 0.
 // Implementation optional.
-func (n *sksNodepoolNodeGroup) Delete() error {
+func (n *sksNodepoolNodeGroup) Delete(ctx context.Context) error {
 	return cloudprovider.ErrNotImplemented
 }
 
 // Autoprovisioned returns true if the node group is autoprovisioned. An autoprovisioned group
 // was created by CA and can be deleted when scaled to 0.
-func (n *sksNodepoolNodeGroup) Autoprovisioned() bool {
+func (n *sksNodepoolNodeGroup) Autoprovisioned(ctx context.Context) bool {
 	return false
 }
 
 // GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
 // sksNodepoolNodeGroup. Returning a nil will result in using default options.
-func (n *sksNodepoolNodeGroup) GetOptions(_ config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
+func (n *sksNodepoolNodeGroup) GetOptions(ctx context.Context, _ config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 

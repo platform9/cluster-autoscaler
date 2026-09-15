@@ -4,7 +4,7 @@
 # Introduction
 
 Cluster Autoscaler is a tool that automatically adjusts the size of the Kubernetes cluster when one of the following conditions is true:
-* there are pods that failed to run in the cluster due to insufficient
+* there are pods that failed to be scheduled in the cluster due to insufficient
   resources.
 * there are nodes in the cluster that have been underutilized for an extended period of time and their pods can be placed on other existing nodes.
 
@@ -23,14 +23,16 @@ You should also take a look at the notes and "gotchas" for your specific cloud p
 * [Civo](./cloudprovider/civo/README.md)
 * [CloudStack](./cloudprovider/cloudstack/README.md)
 * [ClusterAPI](./cloudprovider/clusterapi/README.md)
+* [CoreWeave](./cloudprovider/coreweave/README.md)
 * [DigitalOcean](./cloudprovider/digitalocean/README.md)
+* [Equinix Metal](cloudprovider/equinixmetal/README.md#notes)
 * [Exoscale](./cloudprovider/exoscale/README.md)
-* [Equinix Metal](./cloudprovider/packet/README.md#notes)
 * [External gRPC](./cloudprovider/externalgrpc/README.md)
 * [Hetzner](./cloudprovider/hetzner/README.md)
 * [HuaweiCloud](./cloudprovider/huaweicloud/README.md)
 * [IonosCloud](./cloudprovider/ionoscloud/README.md)
 * [Kamatera](./cloudprovider/kamatera/README.md)
+* [Kwok](./cloudprovider/kwok/README.md)
 * [Linode](./cloudprovider/linode/README.md)
 * [Magnum](./cloudprovider/magnum/README.md)
 * [OracleCloud](./cloudprovider/oci/README.md)
@@ -38,6 +40,7 @@ You should also take a look at the notes and "gotchas" for your specific cloud p
 * [Rancher](./cloudprovider/rancher/README.md)
 * [Scaleway](./cloudprovider/scaleway/README.md)
 * [TencentCloud](./cloudprovider/tencentcloud/README.md)
+* [Utho](./cloudprovider/utho/README.md)
 * [Vultr](./cloudprovider/vultr/README.md)
 
 # Releases
@@ -46,52 +49,79 @@ We recommend using Cluster Autoscaler with the Kubernetes control plane (previou
 
 Starting from Kubernetes 1.12, versioning scheme was changed to match Kubernetes minor releases exactly.
 
-| Kubernetes Version  | CA Version   |
-|--------|--------|
-| 1.26.X | 1.26.X |
-| 1.25.X | 1.25.X |
-| 1.24.X | 1.24.X |
-| 1.23.X | 1.23.X |
-| 1.22.X | 1.22.X |
-| 1.21.X | 1.21.X |
-| 1.20.X | 1.20.X |
-| 1.19.X | 1.19.X |
-| 1.18.X | 1.18.X |
-| 1.17.X | 1.17.X |
-| 1.16.X | 1.16.X |
-| 1.15.X | 1.15.X |
-| 1.14.X | 1.14.X |
-| 1.13.X | 1.13.X |
-| 1.12.X | 1.12.X |
-| 1.11.X | 1.3.X  |
-| 1.10.X | 1.2.X  |
-| 1.9.X  | 1.1.X  |
-| 1.8.X  | 1.0.X  |
-| 1.7.X  | 0.6.X  |
-| 1.6.X  | 0.5.X, 0.6.X<sup>*</sup>  |
-| 1.5.X  | 0.4.X  |
-| 1.4.X  | 0.3.X  |
+| Kubernetes Version | CA Version               | Chart Version |
+|--------------------|--------------------------|---------------|
+| 1.35.x             | 1.35.x                   |9.54.0+|
+| 1.34.x             | 1.34.x                   |9.51.0+|
+| 1.33.x             | 1.33.x                   |9.47.0+|
+| 1.32.x             | 1.32.x                   |9.45.0+|
+| 1.31.x             | 1.31.x                   |9.38.0+|
+| 1.30.x             | 1.30.x                   |9.37.0+|
+| 1.29.X             | 1.29.X                   |9.35.0+|
+| 1.28.X             | 1.28.X                   |9.34.0+|
+| 1.27.X             | 1.27.X                   |9.29.0+|
+| 1.26.X             | 1.26.X                   |9.28.0+|
+| 1.25.X             | 1.25.X                   |               |
+| 1.24.X             | 1.24.X                   |9.25.0+|
+| 1.23.X             | 1.23.X                   |9.14.0+|
+| 1.22.X             | 1.22.X                   |               |
+| 1.21.X             | 1.21.X                   |9.10.0+|
+| 1.20.X             | 1.20.X                   |9.5.0+|
+| 1.19.X             | 1.19.X                   |               |
+| 1.18.X             | 1.18.X                   |9.0.0+|
+| 1.17.X             | 1.17.X                   |               |
+| 1.16.X             | 1.16.X                   |               |
+| 1.15.X             | 1.15.X                   |               |
+| 1.14.X             | 1.14.X                   |               |
+| 1.13.X             | 1.13.X                   |               |
+| 1.12.X             | 1.12.X                   |               |
+| 1.11.X             | 1.3.X                    |               |
+| 1.10.X             | 1.2.X                    |               |
+| 1.9.X              | 1.1.X                    |               |
+| 1.8.X              | 1.0.X                    |               |
+| 1.7.X              | 0.6.X                    |               |
+| 1.6.X              | 0.5.X, 0.6.X<sup>*</sup> |               |
+| 1.5.X              | 0.4.X                    |               |
+| 1.4.X              | 0.3.X                    |               |
 
 <sup>*</sup>Cluster Autoscaler 0.5.X is the official version shipped with k8s 1.6. We've done some basic tests using k8s 1.6 / CA 0.6 and we're not aware of any problems with this setup. However, Cluster Autoscaler internally simulates Kubernetes' scheduler and using different versions of scheduler code can lead to subtle issues.
 
-# Patch releases
+## Schedule
 
-Cluster Autoscaler releases patches for versions corresponding to currently
-supported [Kubernetes versions](https://kubernetes.io/releases/) on a roughly 2
-month cadence. Currently planned schedule is below. Please note that target
-dates listed below are approximate and we expect up to a week difference between
-target ETA and the actual releases.
+Cluster Autoscaler synchronizes its releases with the [Kubernetes release schedule](https://kubernetes.io/releases/).
 
-| Date       | Maintainer Preparing Release | Backup Maintainer |
-|------------|------------------------------|-------------------|
-| 2023-03-15 | MaciekPytel                  | gjtempleton       |
-| 2023-05-17 | gjtempleton                  | towca             |
-| 2023-07-19 | towca                        | x13n              |
-| 2023-09-13 | x13n                         | MaciekPytel       |
-| 2023-11-15 | MaciekPytel                  | gjtempleton       |
+For Cluster Autoscaler releases of new minor versions, expect a release date of up to
+one month after the corresponding Kubernetes release. This is due the fact that upstream
+integrations of Kubernetes into Cluster Autoscaler can't be finalized until the Kubernetes
+release is official, and the time required to test and validate those integrations.
 
-Additional patch releases may happen outside of the schedule in case of critical
-bugs or vulnerabilities.
+Cluster Autoscaler will also release patch versions in accordance with Kubernetes patch
+releases to ensure rapid integration of upstream Kubernetes fixes. The overhead to integrate
+and validate Kubernetes patch releases is less costly, and thus the Cluster Autoscaler
+release date should follow the corresponding Kubernetes release by no more than 1-2 weeks.
+
+Bug fixes and Cloud Provider features to Cluster Autoscaler itself will be continually
+backported into the supported release branches (n - 3, where n is the latest release).
+Backporting into older release branches can be requested as an exception by filing an issue
+and bringing the request [to the official SIG Autoscaling Community](https://github.com/kubernetes/community/blob/master/sig-autoscaling/README.md).
+
+Finally, additional Cluster Autoscaler patch releases may happen outside of the above schedule
+in case of critical bugs or vulnerabilities.
+
+In summary, users should not be guided by a strict patch version equivalency between Kubernetes
+and Cluster Autoscaler (for example, there is no strict requirement to use Cluster Autoscaler v1.34.1 w/ a Kubernetes v1.34.1 cluster). Rather, we recommend that users always use the _latest_
+Cluster Autoscaler release that corresponds to the minor version of Kubernetes that their cluster
+is running.
+
+For example, if the latest (hypothetical) Cluster Autoscaler releases are
+`v1.100.1`, `v1.99.5`, `v1.98.10`, and `v1.97.16`, any of the below scenarios follows the recommended guidance:
+
+| Kubernetes Version  | CA Version               |
+|---------------------|--------------------------|
+| 1.100.0             | 1.100.1                  |
+| 1.99.4              | 1.99.5                   |
+| 1.98.4              | 1.98.10                  |
+| 1.97.16             | 1.97.16                  |
 
 # Notable changes
 
@@ -187,11 +217,9 @@ on them) and set a `priorityClassName: system-cluster-critical` property on your
 (to prevent your pod from being evicted).
 
 Supported cloud providers:
-* GCE https://kubernetes.io/docs/concepts/cluster-administration/cluster-management/
-* GKE https://cloud.google.com/container-engine/docs/cluster-autoscaler
+* AliCloud https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/alicloud/README.md
 * AWS https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/aws/README.md
 * Azure https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/azure/README.md
-* AliCloud https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/alicloud/README.md
 * BaiduCloud https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/baiducloud/README.md
 * BizflyCloud https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/bizflycloud/README.md
 * Brightbox https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/brightbox/README.md
@@ -200,9 +228,11 @@ Supported cloud providers:
 * CloudStack https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/cloudstack/README.md
 * ClusterAPI https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/clusterapi/README.md
 * DigitalOcean https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/digitalocean/README.md
+* Equinix Metal https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/equinixmetal/README.md
 * Exoscale https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/exoscale/README.md
-* Equinix Metal https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/packet/README.md
 * External gRPC https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/externalgrpc/README.md
+* GCE https://kubernetes.io/docs/concepts/cluster-administration/cluster-management/
+* GKE https://cloud.google.com/container-engine/docs/cluster-autoscaler
 * Hetzner https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/hetzner/README.md
 * HuaweiCloud https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/huaweicloud/README.md
 * IonosCloud https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/ionoscloud/README.md
@@ -214,4 +244,5 @@ Supported cloud providers:
 * Rancher https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/rancher/README.md
 * Scaleway https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/scaleway/README.md
 * TencentCloud https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/tencentcloud/README.md
+* Utho https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/utho/README.md
 * Vultr https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/cloudprovider/vultr/README.md

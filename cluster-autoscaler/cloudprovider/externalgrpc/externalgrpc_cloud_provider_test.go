@@ -17,21 +17,26 @@ limitations under the License.
 package externalgrpc
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
+
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/externalgrpc/protos"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 )
 
 func TestCloudProvider_NodeGroups(t *testing.T) {
 	client, m, teardown := setupTest(t)
 	defer teardown()
-	c := newExternalGrpcCloudProvider(client, nil)
+	c := newExternalGrpcCloudProvider(client, defaultGRPCTimeout, nil)
 
 	m.On("Refresh", mock.Anything, mock.Anything).Return(&protos.RefreshResponse{}, nil)
 
@@ -47,17 +52,17 @@ func TestCloudProvider_NodeGroups(t *testing.T) {
 		}, nil,
 	).Times(2)
 
-	ngs := c.NodeGroups()
+	ngs := c.NodeGroups(context.Background())
 	assert.Equal(t, 2, len(ngs))
 	for _, ng := range ngs {
 		if ng.Id() == "1" {
-			assert.Equal(t, 10, ng.MinSize())
-			assert.Equal(t, 20, ng.MaxSize())
-			assert.Equal(t, "test1", ng.Debug())
+			assert.Equal(t, 10, ng.MinSize(context.Background()))
+			assert.Equal(t, 20, ng.MaxSize(context.Background()))
+			assert.Equal(t, "test1", ng.Debug(context.Background()))
 		} else if ng.Id() == "2" {
-			assert.Equal(t, 30, ng.MinSize())
-			assert.Equal(t, 40, ng.MaxSize())
-			assert.Equal(t, "test2", ng.Debug())
+			assert.Equal(t, 30, ng.MinSize(context.Background()))
+			assert.Equal(t, 40, ng.MaxSize(context.Background()))
+			assert.Equal(t, "test2", ng.Debug(context.Background()))
 		} else {
 			assert.Fail(t, "node group id not recognized")
 		}
@@ -65,19 +70,19 @@ func TestCloudProvider_NodeGroups(t *testing.T) {
 
 	// test cached answer
 	m.AssertNumberOfCalls(t, "NodeGroups", 1)
-	ngs = c.NodeGroups()
+	ngs = c.NodeGroups(context.Background())
 	assert.Equal(t, 2, len(ngs))
 	m.AssertNumberOfCalls(t, "NodeGroups", 1)
 
 	// test answer after refresh to clear cached answer
-	err := c.Refresh()
+	err := c.Refresh(context.Background())
 	assert.NoError(t, err)
-	ngs = c.NodeGroups()
+	ngs = c.NodeGroups(context.Background())
 	assert.Equal(t, 2, len(ngs))
 	m.AssertNumberOfCalls(t, "NodeGroups", 2)
 
 	// test empty answer
-	err = c.Refresh()
+	err = c.Refresh(context.Background())
 	assert.NoError(t, err)
 
 	m.On(
@@ -88,12 +93,12 @@ func TestCloudProvider_NodeGroups(t *testing.T) {
 		}, nil,
 	).Once()
 
-	ngs = c.NodeGroups()
+	ngs = c.NodeGroups(context.Background())
 	assert.NotNil(t, ngs)
 	assert.Equal(t, 0, len(ngs))
 
 	// test grpc error
-	err = c.Refresh()
+	err = c.Refresh(context.Background())
 	assert.NoError(t, err)
 
 	m.On(
@@ -105,7 +110,7 @@ func TestCloudProvider_NodeGroups(t *testing.T) {
 		fmt.Errorf("mock error"),
 	).Once()
 
-	ngs = c.NodeGroups()
+	ngs = c.NodeGroups(context.Background())
 	assert.NotNil(t, ngs)
 	assert.Equal(t, 0, len(ngs))
 
@@ -114,7 +119,7 @@ func TestCloudProvider_NodeGroups(t *testing.T) {
 func TestCloudProvider_NodeGroupForNode(t *testing.T) {
 	client, m, teardown := setupTest(t)
 	defer teardown()
-	c := newExternalGrpcCloudProvider(client, nil)
+	c := newExternalGrpcCloudProvider(client, defaultGRPCTimeout, nil)
 
 	m.On("Refresh", mock.Anything, mock.Anything).Return(&protos.RefreshResponse{}, nil)
 
@@ -142,41 +147,41 @@ func TestCloudProvider_NodeGroupForNode(t *testing.T) {
 	apiv1Node1.Name = "node1"
 	apiv1Node1.Spec.ProviderID = "providerId://node1"
 
-	ng1, err := c.NodeGroupForNode(apiv1Node1)
+	ng1, err := c.NodeGroupForNode(context.Background(), apiv1Node1)
 	assert.NoError(t, err)
 	assert.Equal(t, "1", ng1.Id())
-	assert.Equal(t, 10, ng1.MinSize())
-	assert.Equal(t, 20, ng1.MaxSize())
-	assert.Equal(t, "test1", ng1.Debug())
+	assert.Equal(t, 10, ng1.MinSize(context.Background()))
+	assert.Equal(t, 20, ng1.MaxSize(context.Background()))
+	assert.Equal(t, "test1", ng1.Debug(context.Background()))
 
 	apiv1Node2 := &apiv1.Node{}
 	apiv1Node2.Name = "node2"
 	apiv1Node2.Spec.ProviderID = "providerId://node2"
 
-	ng2, err := c.NodeGroupForNode(apiv1Node2)
+	ng2, err := c.NodeGroupForNode(context.Background(), apiv1Node2)
 	assert.NoError(t, err)
 	assert.Equal(t, "2", ng2.Id())
-	assert.Equal(t, 30, ng2.MinSize())
-	assert.Equal(t, 40, ng2.MaxSize())
-	assert.Equal(t, "test2", ng2.Debug())
+	assert.Equal(t, 30, ng2.MinSize(context.Background()))
+	assert.Equal(t, 40, ng2.MaxSize(context.Background()))
+	assert.Equal(t, "test2", ng2.Debug(context.Background()))
 
 	// test cached answer
-	ng1, err = c.NodeGroupForNode(apiv1Node1)
+	ng1, err = c.NodeGroupForNode(context.Background(), apiv1Node1)
 	assert.NoError(t, err)
 	assert.Equal(t, "1", ng1.Id())
 	m.AssertNumberOfCalls(t, "NodeGroupForNode", 2)
 
 	// test clear cache
-	err = c.Refresh()
+	err = c.Refresh(context.Background())
 	assert.NoError(t, err)
 
-	ng1, err = c.NodeGroupForNode(apiv1Node1)
+	ng1, err = c.NodeGroupForNode(context.Background(), apiv1Node1)
 	assert.NoError(t, err)
 	assert.Equal(t, "1", ng1.Id())
 	m.AssertNumberOfCalls(t, "NodeGroupForNode", 3)
 
 	//test no node group for node
-	err = c.Refresh()
+	err = c.Refresh(context.Background())
 	assert.NoError(t, err)
 
 	m.On(
@@ -193,12 +198,12 @@ func TestCloudProvider_NodeGroupForNode(t *testing.T) {
 	apiv1Node3.Name = "node3"
 	apiv1Node3.Spec.ProviderID = "providerId://node3"
 
-	ng3, err := c.NodeGroupForNode(apiv1Node3)
+	ng3, err := c.NodeGroupForNode(context.Background(), apiv1Node3)
 	assert.NoError(t, err)
 	assert.Equal(t, nil, ng3)
 
 	//test grpc error
-	err = c.Refresh()
+	err = c.Refresh(context.Background())
 	assert.NoError(t, err)
 
 	m.On(
@@ -216,25 +221,25 @@ func TestCloudProvider_NodeGroupForNode(t *testing.T) {
 	apiv1Node4.Name = "node4"
 	apiv1Node4.Spec.ProviderID = "providerId://node4"
 
-	_, err = c.NodeGroupForNode(apiv1Node4)
+	_, err = c.NodeGroupForNode(context.Background(), apiv1Node4)
 	assert.Error(t, err)
 
 	//test error is not cached
-	_, err = c.NodeGroupForNode(apiv1Node4)
+	_, err = c.NodeGroupForNode(context.Background(), apiv1Node4)
 	assert.Error(t, err)
 	m.AssertNumberOfCalls(t, "NodeGroupForNode", 6)
 
 	//test nil node param
-	_, err = c.NodeGroupForNode(nil)
+	_, err = c.NodeGroupForNode(context.Background(), nil)
 	assert.Error(t, err)
 }
 
 func TestCloudProvider_Pricing(t *testing.T) {
 	client, m, teardown := setupTest(t)
 	defer teardown()
-	c := newExternalGrpcCloudProvider(client, nil)
+	c := newExternalGrpcCloudProvider(client, defaultGRPCTimeout, nil)
 
-	model, errPricing := c.Pricing()
+	model, errPricing := c.Pricing(context.Background())
 	assert.NoError(t, errPricing)
 	assert.NotNil(t, model)
 
@@ -259,14 +264,14 @@ func TestCloudProvider_Pricing(t *testing.T) {
 	apiv1Node1 := &apiv1.Node{}
 	apiv1Node1.Name = "node1"
 
-	price, err := model.NodePrice(apiv1Node1, time.Time{}, time.Time{})
+	price, err := model.NodePrice(context.Background(), apiv1Node1, time.Time{}, time.Time{})
 	assert.NoError(t, err)
 	assert.Equal(t, float64(100), price)
 
 	apiv1Node2 := &apiv1.Node{}
 	apiv1Node2.Name = "node2"
 
-	price, err = model.NodePrice(apiv1Node2, time.Time{}, time.Time{})
+	price, err = model.NodePrice(context.Background(), apiv1Node2, time.Time{}, time.Time{})
 	assert.NoError(t, err)
 	assert.Equal(t, float64(200), price)
 
@@ -283,13 +288,31 @@ func TestCloudProvider_Pricing(t *testing.T) {
 	apiv1Node3 := &apiv1.Node{}
 	apiv1Node3.Name = "node3"
 
-	_, err = model.NodePrice(apiv1Node3, time.Time{}, time.Time{})
+	_, err = model.NodePrice(context.Background(), apiv1Node3, time.Time{}, time.Time{})
 	assert.Error(t, err)
+
+	// test notImplemented for NodePrice
+	m.On(
+		"PricingNodePrice", mock.Anything, mock.MatchedBy(func(req *protos.PricingNodePriceRequest) bool {
+			return req.Node.Name == "node4"
+		}),
+	).Return(
+		&protos.PricingNodePriceResponse{},
+		status.Error(codes.Unimplemented, "mock error"),
+	)
+
+	apiv1Node4 := &apiv1.Node{}
+	apiv1Node4.Name = "node4"
+
+	_, err = model.NodePrice(context.Background(), apiv1Node4, time.Time{}, time.Time{})
+	assert.Error(t, err)
+	assert.Equal(t, cloudprovider.ErrNotImplemented, err)
 
 	// test correct PodPrice call
 	m.On(
 		"PricingPodPrice", mock.Anything, mock.MatchedBy(func(req *protos.PricingPodPriceRequest) bool {
-			return req.Pod.Name == "pod1"
+			pod := &apiv1.Pod{}
+			return pod.Unmarshal(req.PodBytes) == nil && pod.Name == "pod1"
 		}),
 	).Return(
 		&protos.PricingPodPriceResponse{Price: 100},
@@ -297,7 +320,8 @@ func TestCloudProvider_Pricing(t *testing.T) {
 	)
 	m.On(
 		"PricingPodPrice", mock.Anything, mock.MatchedBy(func(req *protos.PricingPodPriceRequest) bool {
-			return req.Pod.Name == "pod2"
+			pod := &apiv1.Pod{}
+			return pod.Unmarshal(req.PodBytes) == nil && pod.Name == "pod2"
 		}),
 	).Return(
 		&protos.PricingPodPriceResponse{Price: 200},
@@ -307,21 +331,22 @@ func TestCloudProvider_Pricing(t *testing.T) {
 	apiv1Pod1 := &apiv1.Pod{}
 	apiv1Pod1.Name = "pod1"
 
-	price, err = model.PodPrice(apiv1Pod1, time.Time{}, time.Time{})
+	price, err = model.PodPrice(context.Background(), apiv1Pod1, time.Time{}, time.Time{})
 	assert.NoError(t, err)
 	assert.Equal(t, float64(100), price)
 
 	apiv1Pod2 := &apiv1.Pod{}
 	apiv1Pod2.Name = "pod2"
 
-	price, err = model.PodPrice(apiv1Pod2, time.Time{}, time.Time{})
+	price, err = model.PodPrice(context.Background(), apiv1Pod2, time.Time{}, time.Time{})
 	assert.NoError(t, err)
 	assert.Equal(t, float64(200), price)
 
 	// test grpc error for PodPrice
 	m.On(
 		"PricingPodPrice", mock.Anything, mock.MatchedBy(func(req *protos.PricingPodPriceRequest) bool {
-			return req.Pod.Name == "pod3"
+			pod := &apiv1.Pod{}
+			return pod.Unmarshal(req.PodBytes) == nil && pod.Name == "pod3"
 		}),
 	).Return(
 		&protos.PricingPodPriceResponse{},
@@ -331,14 +356,33 @@ func TestCloudProvider_Pricing(t *testing.T) {
 	apiv1Pod3 := &apiv1.Pod{}
 	apiv1Pod3.Name = "pod3"
 
-	_, err = model.PodPrice(apiv1Pod3, time.Time{}, time.Time{})
+	_, err = model.PodPrice(context.Background(), apiv1Pod3, time.Time{}, time.Time{})
 	assert.Error(t, err)
+
+	// test notImplemented for PodPrice
+	m.On(
+		"PricingPodPrice", mock.Anything, mock.MatchedBy(func(req *protos.PricingPodPriceRequest) bool {
+			pod := &apiv1.Pod{}
+			return pod.Unmarshal(req.PodBytes) == nil && pod.Name == "pod4"
+		}),
+	).Return(
+		&protos.PricingPodPriceResponse{},
+		status.Error(codes.Unimplemented, "mock error"),
+	)
+
+	apiv1Pod4 := &apiv1.Pod{}
+	apiv1Pod4.Name = "pod4"
+
+	_, err = model.PodPrice(context.Background(), apiv1Pod4, time.Time{}, time.Time{})
+	assert.Error(t, err)
+	assert.Equal(t, cloudprovider.ErrNotImplemented, err)
+
 }
 
 func TestCloudProvider_GPULabel(t *testing.T) {
 	client, m, teardown := setupTest(t)
 	defer teardown()
-	c := newExternalGrpcCloudProvider(client, nil)
+	c := newExternalGrpcCloudProvider(client, defaultGRPCTimeout, nil)
 
 	m.On("Refresh", mock.Anything, mock.Anything).Return(&protos.RefreshResponse{}, nil)
 
@@ -350,18 +394,18 @@ func TestCloudProvider_GPULabel(t *testing.T) {
 		nil,
 	)
 
-	label := c.GPULabel()
+	label := c.GPULabel(context.Background())
 	assert.Equal(t, "gpu_label", label)
 
 	// test cache
-	label = c.GPULabel()
+	label = c.GPULabel(context.Background())
 	assert.Equal(t, "gpu_label", label)
 	m.AssertNumberOfCalls(t, "GPULabel", 1)
 
 	// test grpc error
 	client2, m2, teardown2 := setupTest(t)
 	defer teardown2()
-	c2 := newExternalGrpcCloudProvider(client2, nil)
+	c2 := newExternalGrpcCloudProvider(client2, defaultGRPCTimeout, nil)
 
 	m2.On("Refresh", mock.Anything, mock.Anything).Return(&protos.RefreshResponse{}, nil)
 
@@ -371,11 +415,11 @@ func TestCloudProvider_GPULabel(t *testing.T) {
 		&protos.GPULabelResponse{Label: "gpu_label"},
 		fmt.Errorf("mock error"),
 	)
-	label = c2.GPULabel()
+	label = c2.GPULabel(context.Background())
 	assert.Equal(t, "", label)
 
 	//test error is not cached
-	label = c2.GPULabel()
+	label = c2.GPULabel(context.Background())
 	assert.Equal(t, "", label)
 	m2.AssertNumberOfCalls(t, "GPULabel", 2)
 
@@ -384,7 +428,7 @@ func TestCloudProvider_GPULabel(t *testing.T) {
 func TestCloudProvider_GetAvailableGPUTypes(t *testing.T) {
 	client, m, teardown := setupTest(t)
 	defer teardown()
-	c := newExternalGrpcCloudProvider(client, nil)
+	c := newExternalGrpcCloudProvider(client, defaultGRPCTimeout, nil)
 
 	m.On("Refresh", mock.Anything, mock.Anything).Return(&protos.RefreshResponse{}, nil)
 
@@ -400,13 +444,13 @@ func TestCloudProvider_GetAvailableGPUTypes(t *testing.T) {
 		nil,
 	)
 
-	gpuTypes := c.GetAvailableGPUTypes()
+	gpuTypes := c.GetAvailableGPUTypes(context.Background())
 	assert.NotNil(t, gpuTypes)
 	assert.NotNil(t, gpuTypes["type1"])
 	assert.NotNil(t, gpuTypes["type2"])
 
 	// test cache
-	gpuTypes = c.GetAvailableGPUTypes()
+	gpuTypes = c.GetAvailableGPUTypes(context.Background())
 	assert.NotNil(t, gpuTypes)
 	assert.NotNil(t, gpuTypes["type1"])
 	assert.NotNil(t, gpuTypes["type2"])
@@ -415,7 +459,7 @@ func TestCloudProvider_GetAvailableGPUTypes(t *testing.T) {
 	// test no gpu types
 	client2, m2, teardown2 := setupTest(t)
 	defer teardown2()
-	c2 := newExternalGrpcCloudProvider(client2, nil)
+	c2 := newExternalGrpcCloudProvider(client2, defaultGRPCTimeout, nil)
 
 	m2.On(
 		"GetAvailableGPUTypes", mock.Anything, mock.Anything,
@@ -424,14 +468,14 @@ func TestCloudProvider_GetAvailableGPUTypes(t *testing.T) {
 		nil,
 	)
 
-	gpuTypes = c2.GetAvailableGPUTypes()
+	gpuTypes = c2.GetAvailableGPUTypes(context.Background())
 	assert.NotNil(t, gpuTypes)
 	assert.Equal(t, 0, len(gpuTypes))
 
 	// test grpc error
 	client3, m3, teardown3 := setupTest(t)
 	defer teardown3()
-	c3 := newExternalGrpcCloudProvider(client3, nil)
+	c3 := newExternalGrpcCloudProvider(client3, defaultGRPCTimeout, nil)
 
 	m3.On(
 		"GetAvailableGPUTypes", mock.Anything, mock.Anything,
@@ -440,11 +484,11 @@ func TestCloudProvider_GetAvailableGPUTypes(t *testing.T) {
 		fmt.Errorf("mock error"),
 	)
 
-	gpuTypes = c3.GetAvailableGPUTypes()
+	gpuTypes = c3.GetAvailableGPUTypes(context.Background())
 	assert.Nil(t, gpuTypes)
 
 	// test error is not cahced
-	gpuTypes = c3.GetAvailableGPUTypes()
+	gpuTypes = c3.GetAvailableGPUTypes(context.Background())
 	assert.Nil(t, gpuTypes)
 	m3.AssertNumberOfCalls(t, "GetAvailableGPUTypes", 2)
 
@@ -453,7 +497,7 @@ func TestCloudProvider_GetAvailableGPUTypes(t *testing.T) {
 func TestCloudProvider_Cleanup(t *testing.T) {
 	client, m, teardown := setupTest(t)
 	defer teardown()
-	c := newExternalGrpcCloudProvider(client, nil)
+	c := newExternalGrpcCloudProvider(client, defaultGRPCTimeout, nil)
 
 	// test correct call
 	m.On(
@@ -463,7 +507,7 @@ func TestCloudProvider_Cleanup(t *testing.T) {
 		nil,
 	).Once()
 
-	err := c.Cleanup()
+	err := c.Cleanup(context.Background())
 	assert.NoError(t, err)
 
 	// test grpc error
@@ -474,14 +518,14 @@ func TestCloudProvider_Cleanup(t *testing.T) {
 		fmt.Errorf("mock error"),
 	).Once()
 
-	err = c.Cleanup()
+	err = c.Cleanup(context.Background())
 	assert.Error(t, err)
 }
 
 func TestCloudProvider_Refresh(t *testing.T) {
 	client, m, teardown := setupTest(t)
 	defer teardown()
-	c := newExternalGrpcCloudProvider(client, nil)
+	c := newExternalGrpcCloudProvider(client, defaultGRPCTimeout, nil)
 
 	// test correct call
 	m.On(
@@ -491,7 +535,7 @@ func TestCloudProvider_Refresh(t *testing.T) {
 		nil,
 	).Once()
 
-	err := c.Refresh()
+	err := c.Refresh(context.Background())
 	assert.NoError(t, err)
 
 	// test grpc error
@@ -502,6 +546,6 @@ func TestCloudProvider_Refresh(t *testing.T) {
 		fmt.Errorf("mock error"),
 	).Once()
 
-	err = c.Refresh()
+	err = c.Refresh(context.Background())
 	assert.Error(t, err)
 }

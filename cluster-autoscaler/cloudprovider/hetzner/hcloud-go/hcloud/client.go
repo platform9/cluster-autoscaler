@@ -1,32 +1,14 @@
-/*
-Copyright 2018 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package hcloud
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
+	"math/rand"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -34,12 +16,15 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/net/http/httpguts"
+
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/hetzner/hcloud-go/hcloud/internal/instrumentation"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/hetzner/hcloud-go/hcloud/schema"
 )
 
-// Endpoint is the base URL of the API.
+// Endpoint is the base URL of the Cloud API.
 const Endpoint = "https://api.hetzner.cloud/v1"
+
+// Endpoint is the base URL of the Hetzner API.
+const HetznerEndpoint = "https://api.hetzner.com/v1"
 
 // UserAgent is the value for the library part of the User-Agent header
 // that is sent with each request.
@@ -59,26 +44,62 @@ func ConstantBackoff(d time.Duration) BackoffFunc {
 }
 
 // ExponentialBackoff returns a BackoffFunc which implements an exponential
-// backoff using the formula: b^retries * d
-func ExponentialBackoff(b float64, d time.Duration) BackoffFunc {
+// backoff, truncated to 60 seconds.
+// See [ExponentialBackoffWithOpts] for more details.
+func ExponentialBackoff(multiplier float64, base time.Duration) BackoffFunc {
+	return ExponentialBackoffWithOpts(ExponentialBackoffOpts{
+		Base:       base,
+		Multiplier: multiplier,
+		Cap:        time.Minute,
+	})
+}
+
+// ExponentialBackoffOpts defines the options used by [ExponentialBackoffWithOpts].
+type ExponentialBackoffOpts struct {
+	Base       time.Duration
+	Multiplier float64
+	Cap        time.Duration
+	Jitter     bool
+}
+
+// ExponentialBackoffWithOpts returns a BackoffFunc which implements an exponential
+// backoff, truncated to a maximum, and an optional full jitter.
+//
+// See https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+func ExponentialBackoffWithOpts(opts ExponentialBackoffOpts) BackoffFunc {
+	baseSeconds := opts.Base.Seconds()
+	capSeconds := opts.Cap.Seconds()
+
 	return func(retries int) time.Duration {
-		return time.Duration(math.Pow(b, float64(retries))) * d
+		// Exponential backoff
+		backoff := baseSeconds * math.Pow(opts.Multiplier, float64(retries))
+		// Cap backoff
+		backoff = math.Min(capSeconds, backoff)
+		// Add jitter
+		if opts.Jitter {
+			backoff = ((backoff - baseSeconds) * rand.Float64()) + baseSeconds // #nosec G404
+		}
+
+		return time.Duration(backoff * float64(time.Second))
 	}
 }
 
 // Client is a client for the Hetzner Cloud API.
 type Client struct {
 	endpoint                string
+	hetznerEndpoint         string
 	token                   string
 	tokenValid              bool
-	pollInterval            time.Duration
-	backoffFunc             BackoffFunc
+	retryBackoffFunc        BackoffFunc
+	retryMaxRetries         int
+	pollBackoffFunc         BackoffFunc
 	httpClient              *http.Client
 	applicationName         string
 	applicationVersion      string
 	userAgent               string
 	debugWriter             io.Writer
-	instrumentationRegistry *prometheus.Registry
+	instrumentationRegistry prometheus.Registerer
+	handler                 handler
 
 	Action           ActionClient
 	Certificate      CertificateClient
@@ -94,11 +115,14 @@ type Client struct {
 	Pricing          PricingClient
 	Server           ServerClient
 	ServerType       ServerTypeClient
+	StorageBox       StorageBoxClient
 	SSHKey           SSHKeyClient
 	Volume           VolumeClient
 	PlacementGroup   PlacementGroupClient
 	RDNS             RDNSClient
 	PrimaryIP        PrimaryIPClient
+	StorageBoxType   StorageBoxTypeClient
+	Zone             ZoneClient
 }
 
 // A ClientOption is used to configure a Client.
@@ -111,6 +135,16 @@ func WithEndpoint(endpoint string) ClientOption {
 	}
 }
 
+// WithHetznerEndpoint configures a Client to use the specified Hetzner API endpoint.
+//
+// Experimental: This option is experimental, breaking changes may occur within minor releases.
+// See https://docs.hetzner.cloud/changelog#2025-06-25-new-api-for-storage-boxes for more details.
+func WithHetznerEndpoint(endpoint string) ClientOption {
+	return func(client *Client) {
+		client.hetznerEndpoint = strings.TrimRight(endpoint, "/")
+	}
+}
+
 // WithToken configures a Client to use the specified token for authentication.
 func WithToken(token string) ClientOption {
 	return func(client *Client) {
@@ -119,18 +153,77 @@ func WithToken(token string) ClientOption {
 	}
 }
 
-// WithPollInterval configures a Client to use the specified interval when polling
-// from the API.
+// WithPollInterval configures a Client to use the specified interval when
+// polling from the API.
+//
+// Deprecated: Setting the poll interval is deprecated, you can now configure
+// [WithPollOpts] with a [ConstantBackoff] to get the same results. To
+// migrate your code, replace your usage like this:
+//
+//	// before
+//	hcloud.WithPollInterval(2 * time.Second)
+//	// now
+//	hcloud.WithPollOpts(hcloud.PollOpts{
+//		BackoffFunc: hcloud.ConstantBackoff(2 * time.Second),
+//	})
 func WithPollInterval(pollInterval time.Duration) ClientOption {
+	return WithPollOpts(PollOpts{
+		BackoffFunc: ConstantBackoff(pollInterval),
+	})
+}
+
+// WithPollBackoffFunc configures a Client to use the specified backoff
+// function when polling from the API.
+//
+// Deprecated: WithPollBackoffFunc is deprecated, use [WithPollOpts] instead.
+func WithPollBackoffFunc(f BackoffFunc) ClientOption {
+	return WithPollOpts(PollOpts{
+		BackoffFunc: f,
+	})
+}
+
+// PollOpts defines the options used by [WithPollOpts].
+type PollOpts struct {
+	BackoffFunc BackoffFunc
+}
+
+// WithPollOpts configures a Client to use the specified options when polling from the API.
+//
+// If [PollOpts.BackoffFunc] is nil, the existing backoff function will be preserved.
+func WithPollOpts(opts PollOpts) ClientOption {
 	return func(client *Client) {
-		client.pollInterval = pollInterval
+		if opts.BackoffFunc != nil {
+			client.pollBackoffFunc = opts.BackoffFunc
+		}
 	}
 }
 
 // WithBackoffFunc configures a Client to use the specified backoff function.
+// The backoff function is used for retrying HTTP requests.
+//
+// Deprecated: WithBackoffFunc is deprecated, use [WithRetryOpts] instead.
 func WithBackoffFunc(f BackoffFunc) ClientOption {
 	return func(client *Client) {
-		client.backoffFunc = f
+		client.retryBackoffFunc = f
+	}
+}
+
+// RetryOpts defines the options used by [WithRetryOpts].
+type RetryOpts struct {
+	BackoffFunc BackoffFunc
+	MaxRetries  int
+}
+
+// WithRetryOpts configures a Client to use the specified options when retrying API
+// requests.
+//
+// If [RetryOpts.BackoffFunc] is nil, the existing backoff function will be preserved.
+func WithRetryOpts(opts RetryOpts) ClientOption {
+	return func(client *Client) {
+		if opts.BackoffFunc != nil {
+			client.retryBackoffFunc = opts.BackoffFunc
+		}
+		client.retryMaxRetries = opts.MaxRetries
 	}
 }
 
@@ -160,7 +253,7 @@ func WithHTTPClient(httpClient *http.Client) ClientOption {
 }
 
 // WithInstrumentation configures a Client to collect metrics about the performed HTTP requests.
-func WithInstrumentation(registry *prometheus.Registry) ClientOption {
+func WithInstrumentation(registry prometheus.Registerer) ClientOption {
 	return func(client *Client) {
 		client.instrumentationRegistry = registry
 	}
@@ -169,11 +262,20 @@ func WithInstrumentation(registry *prometheus.Registry) ClientOption {
 // NewClient creates a new client.
 func NewClient(options ...ClientOption) *Client {
 	client := &Client{
-		endpoint:     Endpoint,
-		tokenValid:   true,
-		httpClient:   &http.Client{},
-		backoffFunc:  ExponentialBackoff(2, 500*time.Millisecond),
-		pollInterval: 500 * time.Millisecond,
+		endpoint:        Endpoint,
+		hetznerEndpoint: HetznerEndpoint,
+		tokenValid:      true,
+		httpClient:      &http.Client{},
+
+		retryBackoffFunc: ExponentialBackoffWithOpts(ExponentialBackoffOpts{
+			Base:       time.Second,
+			Multiplier: 2,
+			Cap:        time.Minute,
+			Jitter:     true,
+		}),
+		retryMaxRetries: 5,
+
+		pollBackoffFunc: ConstantBackoff(500 * time.Millisecond),
 	}
 
 	for _, option := range options {
@@ -183,28 +285,44 @@ func NewClient(options ...ClientOption) *Client {
 	client.buildUserAgent()
 	if client.instrumentationRegistry != nil {
 		i := instrumentation.New("api", client.instrumentationRegistry)
-		client.httpClient.Transport = i.InstrumentedRoundTripper()
+		client.httpClient.Transport = i.InstrumentedRoundTripper(client.httpClient.Transport)
 	}
 
-	client.Action = ActionClient{client: client}
+	client.handler = assembleHandlerChain(client)
+
+	// Cloud API
+	client.Action = ActionClient{action: &ResourceActionClient[noopResource]{client: client}}
 	client.Datacenter = DatacenterClient{client: client}
-	client.FloatingIP = FloatingIPClient{client: client}
-	client.Image = ImageClient{client: client}
+	client.FloatingIP = FloatingIPClient{client: client, Action: &ResourceActionClient[*FloatingIP]{client: client, resource: "floating_ips"}}
+	client.Image = ImageClient{client: client, Action: &ResourceActionClient[*Image]{client: client, resource: "images"}}
 	client.ISO = ISOClient{client: client}
 	client.Location = LocationClient{client: client}
-	client.Network = NetworkClient{client: client}
+	client.Network = NetworkClient{client: client, Action: &ResourceActionClient[*Network]{client: client, resource: "networks"}}
 	client.Pricing = PricingClient{client: client}
-	client.Server = ServerClient{client: client}
+	client.Server = ServerClient{client: client, Action: &ResourceActionClient[*Server]{client: client, resource: "servers"}}
 	client.ServerType = ServerTypeClient{client: client}
 	client.SSHKey = SSHKeyClient{client: client}
-	client.Volume = VolumeClient{client: client}
-	client.LoadBalancer = LoadBalancerClient{client: client}
+	client.Volume = VolumeClient{client: client, Action: &ResourceActionClient[*Volume]{client: client, resource: "volumes"}}
+	client.LoadBalancer = LoadBalancerClient{client: client, Action: &ResourceActionClient[*LoadBalancer]{client: client, resource: "load_balancers"}}
 	client.LoadBalancerType = LoadBalancerTypeClient{client: client}
-	client.Certificate = CertificateClient{client: client}
-	client.Firewall = FirewallClient{client: client}
+	client.Certificate = CertificateClient{client: client, Action: &ResourceActionClient[*Certificate]{client: client, resource: "certificates"}}
+	client.Firewall = FirewallClient{client: client, Action: &ResourceActionClient[*Firewall]{client: client, resource: "firewalls"}}
 	client.PlacementGroup = PlacementGroupClient{client: client}
 	client.RDNS = RDNSClient{client: client}
-	client.PrimaryIP = PrimaryIPClient{client: client}
+	client.PrimaryIP = PrimaryIPClient{client: client, Action: &ResourceActionClient[*PrimaryIP]{client: client, resource: "primary_ips"}}
+	client.Zone = ZoneClient{client: client, Action: &ResourceActionClient[*Zone]{client: client, resource: "zones"}}
+
+	// Hetzner API
+
+	// Shallow copy of the client and overwrite of the API endpoint.
+	// We have two "base clients" because the endpoint is only added to the requests URL 3 layers deep, and we want to avoid passing this info through all the layers. By embedding it in the client, we can easily select which "base client" is used for each "resource client".
+	// We create a shallow copy so the handler chain and prometheus registry are the same values and it is transparent to the user.
+	hetznerClient := new(Client)
+	*hetznerClient = *client
+	hetznerClient.endpoint = hetznerClient.hetznerEndpoint
+
+	client.StorageBox = StorageBoxClient{client: hetznerClient, Action: &ResourceActionClient[*StorageBox]{client: hetznerClient, resource: "storage_boxes"}}
+	client.StorageBoxType = StorageBoxTypeClient{client: hetznerClient}
 
 	return client
 }
@@ -213,14 +331,15 @@ func NewClient(options ...ClientOption) *Client {
 // is assigned with ctx and has all necessary headers set (auth, user agent, etc.).
 func (c *Client) NewRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
 	url := c.endpoint + path
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/json")
 
 	if !c.tokenValid {
-		return nil, errors.New("Authorization token contains invalid characters")
+		return nil, errors.New("authorization token contains invalid characters")
 	} else if c.token != "" {
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
 	}
@@ -228,110 +347,14 @@ func (c *Client) NewRequest(ctx context.Context, method, path string, body io.Re
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req = req.WithContext(ctx)
 	return req, nil
 }
 
 // Do performs an HTTP request against the API.
-func (c *Client) Do(r *http.Request, v interface{}) (*Response, error) {
-	var retries int
-	var body []byte
-	var err error
-	if r.ContentLength > 0 {
-		body, err = ioutil.ReadAll(r.Body)
-		if err != nil {
-			r.Body.Close()
-			return nil, err
-		}
-		r.Body.Close()
-	}
-	for {
-		if r.ContentLength > 0 {
-			r.Body = ioutil.NopCloser(bytes.NewReader(body))
-		}
-
-		if c.debugWriter != nil {
-			dumpReq, err := dumpRequest(r)
-			if err != nil {
-				return nil, err
-			}
-			fmt.Fprintf(c.debugWriter, "--- Request:\n%s\n\n", dumpReq)
-		}
-
-		resp, err := c.httpClient.Do(r)
-		if err != nil {
-			return nil, err
-		}
-		response := &Response{Response: resp}
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			resp.Body.Close()
-			return response, err
-		}
-		resp.Body.Close()
-		resp.Body = ioutil.NopCloser(bytes.NewReader(body))
-
-		if c.debugWriter != nil {
-			dumpResp, err := httputil.DumpResponse(resp, true)
-			if err != nil {
-				return nil, err
-			}
-			fmt.Fprintf(c.debugWriter, "--- Response:\n%s\n\n", dumpResp)
-		}
-
-		if err = response.readMeta(body); err != nil {
-			return response, fmt.Errorf("hcloud: error reading response meta data: %s", err)
-		}
-
-		if resp.StatusCode >= 400 && resp.StatusCode <= 599 {
-			err = errorFromResponse(resp, body)
-			if err == nil {
-				err = fmt.Errorf("hcloud: server responded with status code %d", resp.StatusCode)
-			} else if isRetryable(err) {
-				c.backoff(retries)
-				retries++
-				continue
-			}
-			return response, err
-		}
-		if v != nil {
-			if w, ok := v.(io.Writer); ok {
-				_, err = io.Copy(w, bytes.NewReader(body))
-			} else {
-				err = json.Unmarshal(body, v)
-			}
-		}
-
-		return response, err
-	}
-}
-
-func isRetryable(error error) bool {
-	err, ok := error.(Error)
-	if !ok {
-		return false
-	}
-	return err.Code == ErrorCodeRateLimitExceeded || err.Code == ErrorCodeConflict
-}
-
-func (c *Client) backoff(retries int) {
-	time.Sleep(c.backoffFunc(retries))
-}
-
-func (c *Client) all(f func(int) (*Response, error)) error {
-	var (
-		page = 1
-	)
-	for {
-		resp, err := f(page)
-		if err != nil {
-			return err
-		}
-		if resp.Meta.Pagination == nil || resp.Meta.Pagination.NextPage == 0 {
-			return nil
-		}
-		page = resp.Meta.Pagination.NextPage
-	}
+// v can be nil, an io.Writer to write the response body to or a pointer to
+// a struct to json.Unmarshal the response to.
+func (c *Client) Do(req *http.Request, v any) (*Response, error) {
+	return c.handler.Do(req, v)
 }
 
 func (c *Client) buildUserAgent() {
@@ -345,71 +368,46 @@ func (c *Client) buildUserAgent() {
 	}
 }
 
-func dumpRequest(r *http.Request) ([]byte, error) {
-	// Duplicate the request, so we can redact the auth header
-	rDuplicate := r.Clone(context.Background())
-	rDuplicate.Header.Set("Authorization", "REDACTED")
-
-	// To get the request body we need to read it before the request was actually sent.
-	// See https://github.com/golang/go/issues/29792
-	dumpReq, err := httputil.DumpRequestOut(rDuplicate, true)
-	if err != nil {
-		return nil, err
-	}
-
-	// Set original request body to the duplicate created by DumpRequestOut. The request body is not duplicated
-	// by .Clone() and instead just referenced, so it would be completely read otherwise.
-	r.Body = rDuplicate.Body
-
-	return dumpReq, nil
-}
-
-func errorFromResponse(resp *http.Response, body []byte) error {
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
-		return nil
-	}
-
-	var respBody schema.ErrorResponse
-	if err := json.Unmarshal(body, &respBody); err != nil {
-		return nil
-	}
-	if respBody.Error.Code == "" && respBody.Error.Message == "" {
-		return nil
-	}
-	return ErrorFromSchema(respBody.Error)
-}
+const (
+	headerCorrelationID = "X-Correlation-Id"
+)
 
 // Response represents a response from the API. It embeds http.Response.
 type Response struct {
 	*http.Response
 	Meta Meta
+
+	// body holds a copy of the http.Response body that must be used within the handler
+	// chain. The http.Response.Body is reserved for external users.
+	body []byte
 }
 
-func (r *Response) readMeta(body []byte) error {
-	if h := r.Header.Get("RateLimit-Limit"); h != "" {
-		r.Meta.Ratelimit.Limit, _ = strconv.Atoi(h)
+// populateBody copies the original [http.Response] body into the internal [Response] body
+// property, and restore the original [http.Response] body as if it was untouched.
+func (r *Response) populateBody() error {
+	// Read full response body and save it for later use
+	body, err := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	if err != nil {
+		return err
 	}
-	if h := r.Header.Get("RateLimit-Remaining"); h != "" {
-		r.Meta.Ratelimit.Remaining, _ = strconv.Atoi(h)
-	}
-	if h := r.Header.Get("RateLimit-Reset"); h != "" {
-		if ts, err := strconv.ParseInt(h, 10, 64); err == nil {
-			r.Meta.Ratelimit.Reset = time.Unix(ts, 0)
-		}
-	}
+	r.body = body
 
-	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-		var s schema.MetaResponse
-		if err := json.Unmarshal(body, &s); err != nil {
-			return err
-		}
-		if s.Meta.Pagination != nil {
-			p := PaginationFromSchema(*s.Meta.Pagination)
-			r.Meta.Pagination = &p
-		}
-	}
+	// Restore the body as if it was untouched, as it might be read by external users
+	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	return nil
+}
+
+// hasJSONBody returns whether the response has a JSON body.
+func (r *Response) hasJSONBody() bool {
+	return len(r.body) > 0 && strings.HasPrefix(r.Header.Get("Content-Type"), "application/json")
+}
+
+// internalCorrelationID returns the unique ID of the request as set by the API. This ID can help with support requests,
+// as it allows the people working on identify this request in particular.
+func (r *Response) internalCorrelationID() string {
+	return r.Header.Get(headerCorrelationID)
 }
 
 // Meta represents meta information included in an API response.
@@ -442,7 +440,8 @@ type ListOpts struct {
 	LabelSelector string // Label selector for filtering by labels
 }
 
-func (l ListOpts) values() url.Values {
+// Values returns the ListOpts as URL values.
+func (l ListOpts) Values() url.Values {
 	vals := url.Values{}
 	if l.Page > 0 {
 		vals.Add("page", strconv.Itoa(l.Page))

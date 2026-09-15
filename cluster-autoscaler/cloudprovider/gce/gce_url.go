@@ -18,41 +18,63 @@ package gce
 
 import (
 	"fmt"
-	"strings"
+	"net/url"
+	"path"
+	"regexp"
 )
 
 const (
-	gceUrlSchema    = "https"
-	gceDomainSuffix = "googleapis.com/compute/v1/projects/"
-	// Cluster Autoscaler previously used "content" instead of "www" here, for reasons unknown.
-	gcePrefix           = gceUrlSchema + "://www." + gceDomainSuffix
-	instanceUrlTemplate = gcePrefix + "%s/zones/%s/instances/%s"
-	migUrlTemplate      = gcePrefix + "%s/zones/%s/instanceGroups/%s"
+	projectsSubstring  = "/projects/"
+	defaultDomainUrl   = "https://www.googleapis.com/compute/v1"
+	anyHttpsUrlPattern = "https://.*/"
+)
+
+var (
+	regionalInstanceTemplateRe = regexp.MustCompile("(/projects/.*[A-Za-z0-9]+.*/regions/)")
+	migUrlRe                   = regexp.MustCompile(anyHttpsUrlPattern + "projects/(.*)/zones/(.*)/instanceGroups/(.*)")
+	igmUrlRe                   = regexp.MustCompile(anyHttpsUrlPattern + "projects/(.*)/zones/(.*)/instanceGroupManagers/(.*)")
+	igmRefUrlRe                = regexp.MustCompile("projects/(.*)/zones/(.*)/instanceGroupManagers/(.*)")
+	instanceUrlRe              = regexp.MustCompile(anyHttpsUrlPattern + "projects/(.*)/zones/(.*)/instances/(.*)")
 )
 
 // ParseMigUrl expects url in format:
-// https://www.googleapis.com/compute/v1/projects/<project-id>/zones/<zone>/instanceGroups/<name>
+// https://.*/projects/<project-id>/zones/<zone>/instanceGroups/<name>
 func ParseMigUrl(url string) (project string, zone string, name string, err error) {
-	return parseGceUrl(url, "instanceGroups")
+	return parseGceUrl(url, migUrlRe, anyHttpsUrlPattern, "instanceGroups")
 }
 
 // ParseIgmUrl expects url in format:
-// https://www.googleapis.com/compute/v1/projects/<project-id>/zones/<zone>/instanceGroupManagers/<name>
+// https://.*/<project-id>/zones/<zone>/instanceGroupManagers/<name>
 func ParseIgmUrl(url string) (project string, zone string, name string, err error) {
-	return parseGceUrl(url, "instanceGroupManagers")
+	return parseGceUrl(url, igmUrlRe, anyHttpsUrlPattern, "instanceGroupManagers")
+}
+
+// ParseIgmUrlRef expects url in format:
+// projects/<project-id>/zones/<zone>/instanceGroupManagers/<name>
+// and returns a GceRef struct for it.
+func ParseIgmUrlRef(url string) (GceRef, error) {
+	project, zone, name, err := parseGceUrl(url, igmRefUrlRe, "", "instanceGroupManagers")
+	if err != nil {
+		return GceRef{}, err
+	}
+	return GceRef{
+		Project: project,
+		Zone:    zone,
+		Name:    name,
+	}, nil
 }
 
 // ParseInstanceUrl expects url in format:
-// https://www.googleapis.com/compute/v1/projects/<project-id>/zones/<zone>/instances/<name>
+// https://.*/<project-id>/zones/<zone>/instances/<name>
 func ParseInstanceUrl(url string) (project string, zone string, name string, err error) {
-	return parseGceUrl(url, "instances")
+	return parseGceUrl(url, instanceUrlRe, anyHttpsUrlPattern, "instances")
 }
 
 // ParseInstanceUrlRef expects url in format:
-// https://www.googleapis.com/compute/v1/projects/<project-id>/zones/<zone>/instances/<name>
+// https://.*/projects/<project-id>/zones/<zone>/instances/<name>
 // and returns a GceRef struct for it.
 func ParseInstanceUrlRef(url string) (GceRef, error) {
-	project, zone, name, err := parseGceUrl(url, "instances")
+	project, zone, name, err := ParseInstanceUrl(url)
 	if err != nil {
 		return GceRef{}, err
 	}
@@ -64,32 +86,43 @@ func ParseInstanceUrlRef(url string) (GceRef, error) {
 }
 
 // GenerateInstanceUrl generates url for instance.
-func GenerateInstanceUrl(ref GceRef) string {
-	return fmt.Sprintf(instanceUrlTemplate, ref.Project, ref.Zone, ref.Name)
+func GenerateInstanceUrl(domainUrl string, ref GceRef) string {
+	if domainUrl == "" {
+		domainUrl = defaultDomainUrl
+	}
+	return domainUrl + projectsSubstring + ref.Project + "/zones/" + ref.Zone + "/instances/" + ref.Name
 }
 
 // GenerateMigUrl generates url for instance.
-func GenerateMigUrl(ref GceRef) string {
-	return fmt.Sprintf(migUrlTemplate, ref.Project, ref.Zone, ref.Name)
+func GenerateMigUrl(domainUrl string, ref GceRef) string {
+	if domainUrl == "" {
+		domainUrl = defaultDomainUrl
+	}
+	return domainUrl + projectsSubstring + ref.Project + "/zones/" + ref.Zone + "/instanceGroups/" + ref.Name
 }
 
-func parseGceUrl(url, expectedResource string) (project string, zone string, name string, err error) {
-	errMsg := fmt.Errorf("wrong url: expected format https://www.googleapis.com/compute/v1/projects/<project-id>/zones/<zone>/%s/<name>, got %s", expectedResource, url)
-	if !strings.Contains(url, gceDomainSuffix) {
-		return "", "", "", errMsg
+// IsInstanceTemplateRegional determines whether or not an instance template is regional based on the url
+func IsInstanceTemplateRegional(templateUrl string) bool {
+	return regionalInstanceTemplateRe.MatchString(templateUrl)
+}
+
+// InstanceTemplateNameFromUrl retrieves name of the Instance Template from the url.
+func InstanceTemplateNameFromUrl(instanceTemplateLink string) (InstanceTemplateName, error) {
+	templateUrl, err := url.Parse(instanceTemplateLink)
+	if err != nil {
+		return InstanceTemplateName{}, err
 	}
-	if !strings.HasPrefix(url, gceUrlSchema) {
-		return "", "", "", errMsg
+	_, templateName := path.Split(templateUrl.EscapedPath())
+
+	regional := IsInstanceTemplateRegional(instanceTemplateLink)
+
+	return InstanceTemplateName{templateName, regional}, nil
+}
+
+func parseGceUrl(url string, re *regexp.Regexp, prefix, expectedResource string) (project string, zone string, name string, err error) {
+	subMatches := re.FindStringSubmatch(url)
+	if len(subMatches) < 4 {
+		return "", "", "", fmt.Errorf("wrong url: expected format %sprojects/<project-id>/zones/<zone>/%s/<name>, got %s", prefix, expectedResource, url)
 	}
-	splitted := strings.Split(strings.Split(url, gceDomainSuffix)[1], "/")
-	if len(splitted) != 5 || splitted[1] != "zones" {
-		return "", "", "", errMsg
-	}
-	if splitted[3] != expectedResource {
-		return "", "", "", fmt.Errorf("wrong resource in url: expected %s, got %s", expectedResource, splitted[3])
-	}
-	project = splitted[0]
-	zone = splitted[2]
-	name = splitted[4]
-	return project, zone, name, nil
+	return subMatches[1], subMatches[2], subMatches[3], nil
 }

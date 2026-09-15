@@ -29,13 +29,16 @@ rules:
       - watch
   - apiGroups:
       - ""
+      - events.k8s.io
     resources:
       - events
     verbs:
+      - create
       - get
       - list
       - watch
-      - create
+      - patch
+      - update
   - apiGroups:
       - "poc.autoscaling.k8s.io"
     resources:
@@ -44,7 +47,6 @@ rules:
       - get
       - list
       - watch
-      - patch
   - apiGroups:
       - "autoscaling.k8s.io"
     resources:
@@ -53,6 +55,18 @@ rules:
       - get
       - list
       - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:vpa-status-actor
+rules:
+  - apiGroups:
+      - "autoscaling.k8s.io"
+    resources:
+      - verticalpodautoscalers/status
+    verbs:
+      - get
       - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -82,13 +96,6 @@ rules:
       - create
       - patch
       - delete
-  - apiGroups:
-      - ""
-    resources:
-      - namespaces
-    verbs:
-      - get
-      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -108,6 +115,32 @@ rules:
       - pods/eviction
     verbs:
       - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:vpa-updater-in-place
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods/resize
+      - pods # required for patching vpaInPlaceUpdated annotations onto the pod
+    verbs:
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:vpa-updater-in-place-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:vpa-updater-in-place
+subjects:
+  - kind: ServiceAccount
+    name: vpa-updater
+    namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -136,6 +169,19 @@ subjects:
     namespace: kube-system
   - kind: ServiceAccount
     name: vpa-updater
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:vpa-status-actor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:vpa-status-actor
+subjects:
+  - kind: ServiceAccount
+    name: vpa-recommender
     namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -267,6 +313,7 @@ rules:
       - delete
       - get
       - list
+      - patch
   - apiGroups:
       - "poc.autoscaling.k8s.io"
     resources:
@@ -332,4 +379,80 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: vpa-updater
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: system:leader-locking-vpa-updater
+  namespace: kube-system
+rules:
+  - apiGroups:
+      - "coordination.k8s.io"
+    resources:
+      - leases
+    verbs:
+      - create
+  - apiGroups:
+      - "coordination.k8s.io"
+    resourceNames:
+      - vpa-updater
+    resources:
+      - leases
+    verbs:
+      - get
+      - watch
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: system:leader-locking-vpa-updater
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: system:leader-locking-vpa-updater
+subjects:
+  - kind: ServiceAccount
+    name: vpa-updater
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: system:leader-locking-vpa-recommender
+  namespace: kube-system
+rules:
+  - apiGroups:
+      - "coordination.k8s.io"
+    resources:
+      - leases
+    verbs:
+      - create
+  - apiGroups:
+      - "coordination.k8s.io"
+    resourceNames:
+      # TODO: Clean vpa-recommender up once vpa-recommender-lease is used everywhere. See https://github.com/kubernetes/autoscaler/issues/7461.
+      - vpa-recommender
+      - vpa-recommender-lease
+    resources:
+      - leases
+    verbs:
+      - get
+      - watch
+      - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: system:leader-locking-vpa-recommender
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: system:leader-locking-vpa-recommender
+subjects:
+  - kind: ServiceAccount
+    name: vpa-recommender
     namespace: kube-system

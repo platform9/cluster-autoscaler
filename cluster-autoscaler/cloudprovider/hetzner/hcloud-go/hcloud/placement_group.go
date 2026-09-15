@@ -1,49 +1,30 @@
-/*
-Copyright 2018 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package hcloud
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
-	"strconv"
 	"time"
 
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/hetzner/hcloud-go/hcloud/exp/ctxutil"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/hetzner/hcloud-go/hcloud/schema"
 )
 
 // PlacementGroup represents a Placement Group in the Hetzner Cloud.
 type PlacementGroup struct {
-	ID      int
+	ID      int64
 	Name    string
 	Labels  map[string]string
 	Created time.Time
-	Servers []int
+	Servers []int64
 	Type    PlacementGroupType
 }
 
-// PlacementGroupType specifies the type of a Placement Group
+// PlacementGroupType specifies the type of a Placement Group.
 type PlacementGroupType string
 
 const (
-	// PlacementGroupTypeSpread spreads all servers in the group on different vhosts
+	// PlacementGroupTypeSpread spreads all servers in the group on different vhosts.
 	PlacementGroupTypeSpread PlacementGroupType = "spread"
 )
 
@@ -53,42 +34,34 @@ type PlacementGroupClient struct {
 }
 
 // GetByID retrieves a PlacementGroup by its ID. If the PlacementGroup does not exist, nil is returned.
-func (c *PlacementGroupClient) GetByID(ctx context.Context, id int) (*PlacementGroup, *Response, error) {
-	req, err := c.client.NewRequest(ctx, "GET", fmt.Sprintf("/placement_groups/%d", id), nil)
-	if err != nil {
-		return nil, nil, err
-	}
+func (c *PlacementGroupClient) GetByID(ctx context.Context, id int64) (*PlacementGroup, *Response, error) {
+	const opPath = "/placement_groups/%d"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
 
-	var body schema.PlacementGroupGetResponse
-	resp, err := c.client.Do(req, &body)
+	reqPath := fmt.Sprintf(opPath, id)
+
+	respBody, resp, err := getRequest[schema.PlacementGroupGetResponse](ctx, c.client, reqPath)
 	if err != nil {
 		if IsError(err, ErrorCodeNotFound) {
 			return nil, resp, nil
 		}
-		return nil, nil, err
+		return nil, resp, err
 	}
-	return PlacementGroupFromSchema(body.PlacementGroup), resp, nil
+
+	return PlacementGroupFromSchema(respBody.PlacementGroup), resp, nil
 }
 
 // GetByName retrieves a PlacementGroup by its name. If the PlacementGroup does not exist, nil is returned.
 func (c *PlacementGroupClient) GetByName(ctx context.Context, name string) (*PlacementGroup, *Response, error) {
-	if name == "" {
-		return nil, nil, nil
-	}
-	placementGroups, response, err := c.List(ctx, PlacementGroupListOpts{Name: name})
-	if len(placementGroups) == 0 {
-		return nil, response, err
-	}
-	return placementGroups[0], response, err
+	return firstByName(name, func() ([]*PlacementGroup, *Response, error) {
+		return c.List(ctx, PlacementGroupListOpts{Name: name})
+	})
 }
 
 // Get retrieves a PlacementGroup by its ID if the input can be parsed as an integer, otherwise it
 // retrieves a PlacementGroup by its name. If the PlacementGroup does not exist, nil is returned.
 func (c *PlacementGroupClient) Get(ctx context.Context, idOrName string) (*PlacementGroup, *Response, error) {
-	if id, err := strconv.Atoi(idOrName); err == nil {
-		return c.GetByID(ctx, int(id))
-	}
-	return c.GetByName(ctx, idOrName)
+	return getByIDOrName(ctx, c.GetByID, c.GetByName, idOrName)
 }
 
 // PlacementGroupListOpts specifies options for listing PlacementGroup.
@@ -100,7 +73,7 @@ type PlacementGroupListOpts struct {
 }
 
 func (l PlacementGroupListOpts) values() url.Values {
-	vals := l.ListOpts.values()
+	vals := l.ListOpts.Values()
 	if l.Name != "" {
 		vals.Add("name", l.Name)
 	}
@@ -118,53 +91,33 @@ func (l PlacementGroupListOpts) values() url.Values {
 // Please note that filters specified in opts are not taken into account
 // when their value corresponds to their zero value or when they are empty.
 func (c *PlacementGroupClient) List(ctx context.Context, opts PlacementGroupListOpts) ([]*PlacementGroup, *Response, error) {
-	path := "/placement_groups?" + opts.values().Encode()
-	req, err := c.client.NewRequest(ctx, "GET", path, nil)
+	const opPath = "/placement_groups?%s"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	reqPath := fmt.Sprintf(opPath, opts.values().Encode())
+
+	respBody, resp, err := getRequest[schema.PlacementGroupListResponse](ctx, c.client, reqPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, resp, err
 	}
 
-	var body schema.PlacementGroupListResponse
-	resp, err := c.client.Do(req, &body)
-	if err != nil {
-		return nil, nil, err
-	}
-	placementGroups := make([]*PlacementGroup, 0, len(body.PlacementGroups))
-	for _, g := range body.PlacementGroups {
-		placementGroups = append(placementGroups, PlacementGroupFromSchema(g))
-	}
-	return placementGroups, resp, nil
+	return allFromSchemaFunc(respBody.PlacementGroups, PlacementGroupFromSchema), resp, nil
 }
 
 // All returns all PlacementGroups.
 func (c *PlacementGroupClient) All(ctx context.Context) ([]*PlacementGroup, error) {
-	opts := PlacementGroupListOpts{
-		ListOpts: ListOpts{
-			PerPage: 50,
-		},
-	}
-
-	return c.AllWithOpts(ctx, opts)
+	return c.AllWithOpts(ctx, PlacementGroupListOpts{})
 }
 
 // AllWithOpts returns all PlacementGroups for the given options.
 func (c *PlacementGroupClient) AllWithOpts(ctx context.Context, opts PlacementGroupListOpts) ([]*PlacementGroup, error) {
-	var allPlacementGroups []*PlacementGroup
-
-	err := c.client.all(func(page int) (*Response, error) {
-		opts.Page = page
-		placementGroups, resp, err := c.List(ctx, opts)
-		if err != nil {
-			return resp, err
-		}
-		allPlacementGroups = append(allPlacementGroups, placementGroups...)
-		return resp, nil
-	})
-	if err != nil {
-		return nil, err
+	if opts.ListOpts.PerPage == 0 {
+		opts.ListOpts.PerPage = 50
 	}
-
-	return allPlacementGroups, nil
+	return iterPages(func(page int) ([]*PlacementGroup, *Response, error) {
+		opts.Page = page
+		return c.List(ctx, opts)
+	})
 }
 
 // PlacementGroupCreateOpts specifies options for creating a new PlacementGroup.
@@ -174,10 +127,10 @@ type PlacementGroupCreateOpts struct {
 	Type   PlacementGroupType
 }
 
-// Validate checks if options are valid
+// Validate checks if options are valid.
 func (o PlacementGroupCreateOpts) Validate() error {
 	if o.Name == "" {
-		return errors.New("missing name")
+		return missingField(o, "Name")
 	}
 	return nil
 }
@@ -188,29 +141,27 @@ type PlacementGroupCreateResult struct {
 	Action         *Action
 }
 
-// Create creates a new PlacementGroup
+// Create creates a new PlacementGroup.
 func (c *PlacementGroupClient) Create(ctx context.Context, opts PlacementGroupCreateOpts) (PlacementGroupCreateResult, *Response, error) {
+	const opPath = "/placement_groups"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	result := PlacementGroupCreateResult{}
+
+	reqPath := opPath
+
 	if err := opts.Validate(); err != nil {
-		return PlacementGroupCreateResult{}, nil, err
-	}
-	reqBody := placementGroupCreateOptsToSchema(opts)
-	reqBodyData, err := json.Marshal(reqBody)
-	if err != nil {
-		return PlacementGroupCreateResult{}, nil, err
-	}
-	req, err := c.client.NewRequest(ctx, "POST", "/placement_groups", bytes.NewReader(reqBodyData))
-	if err != nil {
-		return PlacementGroupCreateResult{}, nil, err
+		return result, nil, err
 	}
 
-	respBody := schema.PlacementGroupCreateResponse{}
-	resp, err := c.client.Do(req, &respBody)
+	reqBody := placementGroupCreateOptsToSchema(opts)
+
+	respBody, resp, err := postRequest[schema.PlacementGroupCreateResponse](ctx, c.client, reqPath, reqBody)
 	if err != nil {
-		return PlacementGroupCreateResult{}, nil, err
+		return result, resp, err
 	}
-	result := PlacementGroupCreateResult{
-		PlacementGroup: PlacementGroupFromSchema(respBody.PlacementGroup),
-	}
+
+	result.PlacementGroup = PlacementGroupFromSchema(respBody.PlacementGroup)
 	if respBody.Action != nil {
 		result.Action = ActionFromSchema(*respBody.Action)
 	}
@@ -226,6 +177,11 @@ type PlacementGroupUpdateOpts struct {
 
 // Update updates a PlacementGroup.
 func (c *PlacementGroupClient) Update(ctx context.Context, placementGroup *PlacementGroup, opts PlacementGroupUpdateOpts) (*PlacementGroup, *Response, error) {
+	const opPath = "/placement_groups/%d"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	reqPath := fmt.Sprintf(opPath, placementGroup.ID)
+
 	reqBody := schema.PlacementGroupUpdateRequest{}
 	if opts.Name != "" {
 		reqBody.Name = &opts.Name
@@ -233,19 +189,8 @@ func (c *PlacementGroupClient) Update(ctx context.Context, placementGroup *Place
 	if opts.Labels != nil {
 		reqBody.Labels = &opts.Labels
 	}
-	reqBodyData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, nil, err
-	}
 
-	path := fmt.Sprintf("/placement_groups/%d", placementGroup.ID)
-	req, err := c.client.NewRequest(ctx, "PUT", path, bytes.NewReader(reqBodyData))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	respBody := schema.PlacementGroupUpdateResponse{}
-	resp, err := c.client.Do(req, &respBody)
+	respBody, resp, err := putRequest[schema.PlacementGroupUpdateResponse](ctx, c.client, reqPath, reqBody)
 	if err != nil {
 		return nil, resp, err
 	}
@@ -255,9 +200,10 @@ func (c *PlacementGroupClient) Update(ctx context.Context, placementGroup *Place
 
 // Delete deletes a PlacementGroup.
 func (c *PlacementGroupClient) Delete(ctx context.Context, placementGroup *PlacementGroup) (*Response, error) {
-	req, err := c.client.NewRequest(ctx, "DELETE", fmt.Sprintf("/placement_groups/%d", placementGroup.ID), nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.client.Do(req, nil)
+	const opPath = "/placement_groups/%d"
+	ctx = ctxutil.SetOpPath(ctx, opPath)
+
+	reqPath := fmt.Sprintf(opPath, placementGroup.ID)
+
+	return deleteRequestNoResult(ctx, c.client, reqPath)
 }

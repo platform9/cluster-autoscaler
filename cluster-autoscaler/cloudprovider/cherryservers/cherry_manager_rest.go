@@ -40,20 +40,21 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
-	"k8s.io/autoscaler/cluster-autoscaler/version"
 	klog "k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/config"
+	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/gpu"
+	"sigs.k8s.io/cluster-autoscaler/pkg/version"
 )
 
 const (
-	userAgent                    = "kubernetes/cluster-autoscaler/" + version.ClusterAutoscalerVersion
 	expectedAPIContentTypePrefix = "application/json"
 	cherryPrefix                 = "cherryservers://"
 	baseURL                      = "https://api.cherryservers.com/v1/"
 )
+
+var userAgent = "kubernetes/cluster-autoscaler/" + version.ClusterAutoscalerVersion
 
 type instanceType struct {
 	InstanceName string
@@ -540,7 +541,7 @@ func (mgr *cherryManagerRest) deleteServer(ctx context.Context, nodegroup string
 		return err
 	}
 
-	klog.Infof("Deleted server %s: %v", id, result)
+	klog.Infof("Deleted server %d: %v", id, result)
 	return nil
 
 }
@@ -591,10 +592,10 @@ func (mgr *cherryManagerRest) deleteNodes(nodegroup string, nodes []NodeRef, upd
 
 			switch {
 			case s.Hostname == n.Name:
-				klog.V(1).Infof("Matching Cherry Server %s - %s", s.Hostname, s.ID)
+				klog.V(1).Infof("Matching Cherry Server %s - %d", s.Hostname, s.ID)
 				errList = append(errList, mgr.deleteServer(ctx, nodegroup, s.ID))
 			case fakeNode && int(nodeID) == s.ID:
-				klog.V(1).Infof("Fake Node %s", s.ID)
+				klog.V(1).Infof("Fake Node %d", s.ID)
 				errList = append(errList, mgr.deleteServer(ctx, nodegroup, s.ID))
 			}
 		}
@@ -618,7 +619,7 @@ func BuildGenericLabels(nodegroup string, plan *Plan) map[string]string {
 
 // templateNodeInfo returns a NodeInfo with a node template based on the Cherry Servers plan
 // that is used to create nodes in a given node group.
-func (mgr *cherryManagerRest) templateNodeInfo(nodegroup string) (*schedulerframework.NodeInfo, error) {
+func (mgr *cherryManagerRest) templateNodeInfo(nodegroup string) (*framework.NodeInfo, error) {
 	node := apiv1.Node{}
 	nodeName := fmt.Sprintf("%s-asg-%d", nodegroup, rand.Int63())
 	node.ObjectMeta = metav1.ObjectMeta{
@@ -664,8 +665,7 @@ func (mgr *cherryManagerRest) templateNodeInfo(nodegroup string) (*schedulerfram
 	// GenericLabels
 	node.Labels = cloudprovider.JoinStringMaps(node.Labels, BuildGenericLabels(nodegroup, cherryPlan))
 
-	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(nodegroup))
-	nodeInfo.SetNode(&node)
+	nodeInfo := framework.NewNodeInfo(&node, nil, framework.NewPodInfo(cloudprovider.BuildKubeProxy(nodegroup), nil))
 	return nodeInfo, nil
 }
 

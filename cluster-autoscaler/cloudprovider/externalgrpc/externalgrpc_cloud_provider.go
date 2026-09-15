@@ -27,27 +27,44 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"gopkg.in/yaml.v2"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/externalgrpc/protos"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
+	"k8s.io/client-go/informers"
 	klog "k8s.io/klog/v2"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider/builder"
+	coreoptions "sigs.k8s.io/cluster-autoscaler/pkg/core/options"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/gpu"
+	"sigs.k8s.io/yaml"
 )
 
 const (
-	grpcTimeout = 5 * time.Second
+	defaultGRPCTimeout = 5 * time.Second
 )
+
+// ProviderName is the cloud provider name for this provider.
+const ProviderName = "externalgrpc"
+
+func init() {
+	builder.RegisterCloudProvider(ProviderName, func(opts *coreoptions.AutoscalerOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter, informerFactory informers.SharedInformerFactory) cloudprovider.CloudProvider {
+		return BuildExternalGrpc(opts, do, rl)
+	})
+	builder.SetDefaultCloudProvider(ProviderName)
+}
 
 // externalGrpcCloudProvider implements CloudProvider interface.
 type externalGrpcCloudProvider struct {
 	resourceLimiter *cloudprovider.ResourceLimiter
 	client          protos.CloudProviderClient
+	grpcTimeout     time.Duration
 
 	mutex                 sync.Mutex
 	nodeGroupForNodeCache map[string]cloudprovider.NodeGroup // used to cache NodeGroupForNode grpc calls. Discarded at each Refresh()
@@ -58,11 +75,11 @@ type externalGrpcCloudProvider struct {
 
 // Name returns name of the cloud provider.
 func (e *externalGrpcCloudProvider) Name() string {
-	return cloudprovider.ExternalGrpcProviderName
+	return ProviderName
 }
 
 // NodeGroups returns all node groups configured for this cloud provider.
-func (e *externalGrpcCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
+func (e *externalGrpcCloudProvider) NodeGroups(ctx context.Context) []cloudprovider.NodeGroup {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 
@@ -71,7 +88,7 @@ func (e *externalGrpcCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 		return e.nodeGroupsCache
 	}
 	nodeGroups := make([]cloudprovider.NodeGroup, 0)
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), e.grpcTimeout)
 	defer cancel()
 	klog.V(5).Info("Performing gRPC call NodeGroups")
 	res, err := e.client.NodeGroups(ctx, &protos.NodeGroupsRequest{})
@@ -81,11 +98,12 @@ func (e *externalGrpcCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 	}
 	for _, pbNg := range res.GetNodeGroups() {
 		ng := &NodeGroup{
-			id:      pbNg.Id,
-			minSize: int(pbNg.MinSize),
-			maxSize: int(pbNg.MaxSize),
-			debug:   pbNg.Debug,
-			client:  e.client,
+			id:          pbNg.Id,
+			minSize:     int(pbNg.MinSize),
+			maxSize:     int(pbNg.MaxSize),
+			debug:       pbNg.Debug,
+			client:      e.client,
+			grpcTimeout: e.grpcTimeout,
 		}
 		nodeGroups = append(nodeGroups, ng)
 	}
@@ -96,7 +114,7 @@ func (e *externalGrpcCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 // NodeGroupForNode returns the node group for the given node, nil if the node
 // should not be processed by cluster autoscaler, or non-nil error if such
 // occurred. Must be implemented.
-func (e *externalGrpcCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.NodeGroup, error) {
+func (e *externalGrpcCloudProvider) NodeGroupForNode(ctx context.Context, node *apiv1.Node) (cloudprovider.NodeGroup, error) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 
@@ -107,10 +125,13 @@ func (e *externalGrpcCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudpro
 	// lookup cache
 	if ng, ok := e.nodeGroupForNodeCache[nodeID]; ok {
 		klog.V(5).Infof("Returning cached information for NodeGroupForNode for node %v - %v", node.Name, node.Spec.ProviderID)
+		if ng == nil {
+			return nil, nil
+		}
 		return ng, nil
 	}
 	// perform grpc call
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), e.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupForNode for node %v - %v", node.Name, node.Spec.ProviderID)
 	res, err := e.client.NodeGroupForNode(ctx, &protos.NodeGroupForNodeRequest{
@@ -125,39 +146,44 @@ func (e *externalGrpcCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudpro
 		return nil, nil
 	}
 	ng := &NodeGroup{
-		id:      pbNg.GetId(),
-		maxSize: int(pbNg.GetMaxSize()),
-		minSize: int(pbNg.GetMinSize()),
-		debug:   pbNg.GetDebug(),
-		client:  e.client,
+		id:          pbNg.GetId(),
+		maxSize:     int(pbNg.GetMaxSize()),
+		minSize:     int(pbNg.GetMinSize()),
+		debug:       pbNg.GetDebug(),
+		client:      e.client,
+		grpcTimeout: e.grpcTimeout,
 	}
 	e.nodeGroupForNodeCache[nodeID] = ng
 	return ng, nil
 }
 
 // HasInstance returns whether a given node has a corresponding instance in this cloud provider
-func (e *externalGrpcCloudProvider) HasInstance(node *apiv1.Node) (bool, error) {
+func (e *externalGrpcCloudProvider) HasInstance(ctx context.Context, node *apiv1.Node) (bool, error) {
 	return true, cloudprovider.ErrNotImplemented
 }
 
 // pricingModel implements cloudprovider.PricingModel interface.
 type pricingModel struct {
-	client protos.CloudProviderClient
+	client      protos.CloudProviderClient
+	grpcTimeout time.Duration
 }
 
 // NodePrice returns a price of running the given node for a given period of time.
-func (m *pricingModel) NodePrice(node *apiv1.Node, startTime time.Time, endTime time.Time) (float64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+func (m *pricingModel) NodePrice(ctx context.Context, node *apiv1.Node, startTime time.Time, endTime time.Time) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), m.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call PricingNodePrice for node %v", node.Name)
-	start := metav1.NewTime(startTime)
-	end := metav1.NewTime(endTime)
 	res, err := m.client.PricingNodePrice(ctx, &protos.PricingNodePriceRequest{
-		Node:      externalGrpcNode(node),
-		StartTime: &start,
-		EndTime:   &end,
+		Node: externalGrpcNode(node),
+
+		StartTimestamp: timestamppb.New(startTime),
+		EndTimestamp:   timestamppb.New(endTime),
 	})
 	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.Unimplemented {
+			return 0, cloudprovider.ErrNotImplemented
+		}
 		klog.V(1).Infof("Error on gRPC call PricingNodePrice: %v", err)
 		return 0, err
 	}
@@ -166,18 +192,26 @@ func (m *pricingModel) NodePrice(node *apiv1.Node, startTime time.Time, endTime 
 
 // PodPrice returns a theoretical minimum price of running a pod for a given
 // period of time on a perfectly matching machine.
-func (m *pricingModel) PodPrice(pod *apiv1.Pod, startTime time.Time, endTime time.Time) (float64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+func (m *pricingModel) PodPrice(ctx context.Context, pod *apiv1.Pod, startTime time.Time, endTime time.Time) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), m.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call PricingPodPrice for pod %v", pod.Name)
-	start := metav1.NewTime(startTime)
-	end := metav1.NewTime(endTime)
+
+	podBytes, err := pod.Marshal()
+	if err != nil {
+		return 0, err
+	}
+
 	res, err := m.client.PricingPodPrice(ctx, &protos.PricingPodPriceRequest{
-		Pod:       pod,
-		StartTime: &start,
-		EndTime:   &end,
+		PodBytes:       podBytes,
+		StartTimestamp: timestamppb.New(startTime),
+		EndTimestamp:   timestamppb.New(endTime),
 	})
 	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.Unimplemented {
+			return 0, cloudprovider.ErrNotImplemented
+		}
 		klog.V(1).Infof("Error on gRPC call PricingPodPrice: %v", err)
 		return 0, err
 	}
@@ -190,33 +224,34 @@ func (m *pricingModel) PodPrice(pod *apiv1.Pod, startTime time.Time, endTime tim
 // The external gRPC provider will always return a pricing model without errors,
 // even if a cloud provider does not actually support this feature, errors will be returned
 // by subsequent calls to the pricing model if this is the case.
-func (e *externalGrpcCloudProvider) Pricing() (cloudprovider.PricingModel, errors.AutoscalerError) {
+func (e *externalGrpcCloudProvider) Pricing(ctx context.Context) (cloudprovider.PricingModel, errors.AutoscalerError) {
 	return &pricingModel{
-		client: e.client,
+		client:      e.client,
+		grpcTimeout: e.grpcTimeout,
 	}, nil
 }
 
 // GetAvailableMachineTypes get all machine types that can be requested from the cloud provider.
 // Implementation optional.
-func (e *externalGrpcCloudProvider) GetAvailableMachineTypes() ([]string, error) {
+func (e *externalGrpcCloudProvider) GetAvailableMachineTypes(ctx context.Context) ([]string, error) {
 	return []string{}, cloudprovider.ErrNotImplemented
 }
 
 // NewNodeGroup builds a theoretical node group based on the node definition provided. The node group is not automatically
 // created on the cloud provider side. The node group is not returned by NodeGroups() until it is created.
 // Implementation optional.
-func (e *externalGrpcCloudProvider) NewNodeGroup(machineType string, labels map[string]string, systemLabels map[string]string,
+func (e *externalGrpcCloudProvider) NewNodeGroup(ctx context.Context, machineType string, labels map[string]string, systemLabels map[string]string,
 	taints []apiv1.Taint, extraResources map[string]resource.Quantity) (cloudprovider.NodeGroup, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // GetResourceLimiter returns struct containing limits (max, min) for resources (cores, memory etc.).
-func (e *externalGrpcCloudProvider) GetResourceLimiter() (*cloudprovider.ResourceLimiter, error) {
+func (e *externalGrpcCloudProvider) GetResourceLimiter(ctx context.Context) (*cloudprovider.ResourceLimiter, error) {
 	return e.resourceLimiter, nil
 }
 
 // GPULabel returns the label added to nodes with GPU resource.
-func (e *externalGrpcCloudProvider) GPULabel() string {
+func (e *externalGrpcCloudProvider) GPULabel(ctx context.Context) string {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 
@@ -224,7 +259,7 @@ func (e *externalGrpcCloudProvider) GPULabel() string {
 		klog.V(5).Info("Returning cached GPULabel")
 		return *e.gpuLabelCache
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), e.grpcTimeout)
 	defer cancel()
 	klog.V(5).Info("Performing gRPC call GPULabel")
 	res, err := e.client.GPULabel(ctx, &protos.GPULabelRequest{})
@@ -238,7 +273,7 @@ func (e *externalGrpcCloudProvider) GPULabel() string {
 }
 
 // GetAvailableGPUTypes return all available GPU types cloud provider supports.
-func (e *externalGrpcCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
+func (e *externalGrpcCloudProvider) GetAvailableGPUTypes(ctx context.Context) map[string]struct{} {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 
@@ -246,7 +281,7 @@ func (e *externalGrpcCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 		klog.V(5).Info("Returning cached GetAvailableGPUTypes")
 		return e.gpuTypesCache
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), e.grpcTimeout)
 	defer cancel()
 	klog.V(5).Info("Performing gRPC call GetAvailableGPUTypes")
 	res, err := e.client.GetAvailableGPUTypes(ctx, &protos.GetAvailableGPUTypesRequest{})
@@ -265,13 +300,13 @@ func (e *externalGrpcCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
 
 // GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
 // any GPUs, it returns nil.
-func (e *externalGrpcCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
-	return gpu.GetNodeGPUFromCloudProvider(e, node)
+func (e *externalGrpcCloudProvider) GetNodeGpuConfig(ctx context.Context, node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(context.TODO(), e, node)
 }
 
 // Cleanup cleans up open resources before the cloud provider is destroyed, i.e. go routines etc.
-func (e *externalGrpcCloudProvider) Cleanup() error {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+func (e *externalGrpcCloudProvider) Cleanup(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), e.grpcTimeout)
 	defer cancel()
 	klog.V(5).Info("Performing gRPC call Cleanup")
 	_, err := e.client.Cleanup(ctx, &protos.CleanupRequest{})
@@ -284,13 +319,13 @@ func (e *externalGrpcCloudProvider) Cleanup() error {
 
 // Refresh is called before every main loop and can be used to dynamically update cloud provider state.
 // In particular the list of node groups returned by NodeGroups can change as a result of CloudProvider.Refresh().
-func (e *externalGrpcCloudProvider) Refresh() error {
+func (e *externalGrpcCloudProvider) Refresh(ctx context.Context) error {
 	// invalidate cache
 	e.mutex.Lock()
 	e.nodeGroupForNodeCache = make(map[string]cloudprovider.NodeGroup)
 	e.nodeGroupsCache = nil
 	e.mutex.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), e.grpcTimeout)
 	defer cancel()
 	klog.V(5).Info("Performing gRPC call Refresh")
 	_, err := e.client.Refresh(ctx, &protos.RefreshRequest{})
@@ -303,7 +338,7 @@ func (e *externalGrpcCloudProvider) Refresh() error {
 
 // BuildExternalGrpc builds the externalgrpc cloud provider.
 func BuildExternalGrpc(
-	opts config.AutoscalingOptions,
+	opts *coreoptions.AutoscalerOptions,
 	do cloudprovider.NodeGroupDiscoveryOptions,
 	rl *cloudprovider.ResourceLimiter,
 ) cloudprovider.CloudProvider {
@@ -314,30 +349,32 @@ func BuildExternalGrpc(
 	if err != nil {
 		klog.Fatalf("Could not open cloud provider configuration file %q: %v", opts.CloudConfig, err)
 	}
-	client, err := newExternalGrpcCloudProviderClient(config)
+	client, grpcTimeout, err := newExternalGrpcCloudProviderClient(config)
 	if err != nil {
 		klog.Fatalf("Could not create gRPC client: %v", err)
 	}
-	return newExternalGrpcCloudProvider(client, rl)
+	return newExternalGrpcCloudProvider(client, grpcTimeout, rl)
 }
 
 // cloudConfig is the struct hoding the configs to connect to the external cluster autoscaler provider service.
+// sigs.k8s.io/yaml actually reads the json tag
 type cloudConfig struct {
-	Address string `yaml:"address"` // external cluster autoscaler provider address of the form "host:port", "host%zone:port", "[host]:port" or "[host%zone]:port"
-	Key     string `yaml:"key"`     // path to file containing the tls key
-	Cert    string `yaml:"cert"`    // path to file containing the tls certificate
-	Cacert  string `yaml:"cacert"`  // path to file containing the CA certificate
+	Address     string           `json:"address"`                // external cluster autoscaler provider address of the form "host:port", "host%zone:port", "[host]:port" or "[host%zone]:port"
+	Key         string           `json:"key"`                    // path to file containing the tls key
+	Cert        string           `json:"cert"`                   // path to file containing the tls certificate
+	Cacert      string           `json:"cacert"`                 // path to file containing the CA certificate
+	GRPCTimeout *metav1.Duration `json:"grpc_timeout,omitempty"` // timeout of invoking a grpc call
 }
 
-func newExternalGrpcCloudProviderClient(config []byte) (protos.CloudProviderClient, error) {
+func newExternalGrpcCloudProviderClient(config []byte) (protos.CloudProviderClient, time.Duration, error) {
 	var yamlConfig cloudConfig
 	err := yaml.Unmarshal([]byte(config), &yamlConfig)
 	if err != nil {
-		return nil, fmt.Errorf("can't parse YAML: %v", err)
+		return nil, 0, fmt.Errorf("can't parse YAML: %v", err)
 	}
 	host, _, err := net.SplitHostPort(yamlConfig.Address)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse address: %v", err)
+		return nil, 0, fmt.Errorf("failed to parse address: %v", err)
 	}
 	var dialOpt grpc.DialOption
 	if len(yamlConfig.Cert) == 0 {
@@ -346,24 +383,24 @@ func newExternalGrpcCloudProviderClient(config []byte) (protos.CloudProviderClie
 	} else {
 		certFile, err := ioutil.ReadFile(yamlConfig.Cert)
 		if err != nil {
-			return nil, fmt.Errorf("could not open Cert configuration file %q: %v", yamlConfig.Cert, err)
+			return nil, 0, fmt.Errorf("could not open Cert configuration file %q: %v", yamlConfig.Cert, err)
 		}
 		keyFile, err := ioutil.ReadFile(yamlConfig.Key)
 		if err != nil {
-			return nil, fmt.Errorf("could not open Key configuration file %q: %v", yamlConfig.Key, err)
+			return nil, 0, fmt.Errorf("could not open Key configuration file %q: %v", yamlConfig.Key, err)
 		}
 		cacertFile, err := ioutil.ReadFile(yamlConfig.Cacert)
 		if err != nil {
-			return nil, fmt.Errorf("could not open Cacert configuration file %q: %v", yamlConfig.Cacert, err)
+			return nil, 0, fmt.Errorf("could not open Cacert configuration file %q: %v", yamlConfig.Cacert, err)
 		}
 		cert, err := tls.X509KeyPair(certFile, keyFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse cert key pair: %v", err)
+			return nil, 0, fmt.Errorf("failed to parse cert key pair: %v", err)
 		}
 		certPool := x509.NewCertPool()
 		ok := certPool.AppendCertsFromPEM(cacertFile)
 		if !ok {
-			return nil, fmt.Errorf("failed to parse ca: %v", err)
+			return nil, 0, fmt.Errorf("failed to parse ca: %v", err)
 		}
 		transportCreds := credentials.NewTLS(&tls.Config{
 			ServerName:   host,
@@ -374,15 +411,22 @@ func newExternalGrpcCloudProviderClient(config []byte) (protos.CloudProviderClie
 	}
 	conn, err := grpc.Dial(yamlConfig.Address, dialOpt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial server: %v", err)
+		return nil, 0, fmt.Errorf("failed to dial server: %v", err)
 	}
-	return protos.NewCloudProviderClient(conn), nil
+	var timeout time.Duration
+	if gt := yamlConfig.GRPCTimeout; gt != nil {
+		timeout = gt.Duration
+	} else {
+		timeout = defaultGRPCTimeout
+	}
+	return protos.NewCloudProviderClient(conn), timeout, nil
 }
 
-func newExternalGrpcCloudProvider(client protos.CloudProviderClient, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+func newExternalGrpcCloudProvider(client protos.CloudProviderClient, grpcTimeout time.Duration, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
 	return &externalGrpcCloudProvider{
 		resourceLimiter:       rl,
 		client:                client,
+		grpcTimeout:           grpcTimeout,
 		nodeGroupForNodeCache: make(map[string]cloudprovider.NodeGroup),
 	}
 }

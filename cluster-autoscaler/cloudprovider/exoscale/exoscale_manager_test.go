@@ -20,17 +20,18 @@ import (
 	"os"
 
 	egoscale "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/exoscale/internal/github.com/exoscale/egoscale/v2"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 )
 
 func (ts *cloudProviderTestSuite) TestNewManager() {
-	manager, err := newManager()
+	manager, err := newManager(cloudprovider.NodeGroupDiscoveryOptions{})
 	ts.Require().NoError(err)
 	ts.Require().NotNil(manager)
 
 	os.Unsetenv("EXOSCALE_API_KEY")
 	os.Unsetenv("EXOSCALE_API_SECRET")
 
-	manager, err = newManager()
+	manager, err = newManager(cloudprovider.NodeGroupDiscoveryOptions{})
 	ts.Require().Error(err)
 	ts.Require().Nil(manager)
 }

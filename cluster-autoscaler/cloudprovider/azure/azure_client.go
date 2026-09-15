@@ -19,280 +19,310 @@ package azure
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
-	"net/http"
 	"os"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-07-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2017-05-10/resources"
-	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2021-02-01/storage"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/adal"
+	_ "go.uber.org/mock/mockgen/model" // for go:generate
+
+	azextensions "github.com/Azure/azure-sdk-for-go-extensions/pkg/middleware"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	azurecore_policy "github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	armcomputev7 "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v8"
 	"github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/azure/auth"
 
 	klog "k8s.io/klog/v2"
 
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/containerserviceclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/diskclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/interfaceclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/storageaccountclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/vmclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/vmssclient"
-	"sigs.k8s.io/cloud-provider-azure/pkg/azureclients/vmssvmclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/accountclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/diskclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/interfaceclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachineclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachinescalesetclient"
+	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachinescalesetvmclient"
 )
 
-// DeploymentsClient defines needed functions for azure network.DeploymentsClient.
-type DeploymentsClient interface {
-	Get(ctx context.Context, resourceGroupName string, deploymentName string) (result resources.DeploymentExtended, err error)
-	List(ctx context.Context, resourceGroupName string, filter string, top *int32) (result []resources.DeploymentExtended, err error)
-	ExportTemplate(ctx context.Context, resourceGroupName string, deploymentName string) (result resources.DeploymentExportResult, err error)
-	CreateOrUpdate(ctx context.Context, resourceGroupName string, deploymentName string, parameters resources.Deployment) (resp *http.Response, err error)
-	Delete(ctx context.Context, resourceGroupName string, deploymentName string) (resp *http.Response, err error)
+//go:generate sh -c "mockgen -source=azure_client.go -package azure -exclude_interfaces DeploymentsClient | cat ../../../hack/boilerplate/boilerplate.go.txt - > azure_mock_agentpool_client.go"
+//go:generate sh -c "mockgen -package=azure sigs.k8s.io/cloud-provider-azure/pkg/azclient/virtualmachineclient Interface | cat ../../../hack/boilerplate/boilerplate.go.txt - > azure_mock_virtualmachine_client_test.go"
+
+const (
+	vmsContextTimeout      = 5 * time.Minute
+	vmsAsyncContextTimeout = 30 * time.Minute
+)
+
+// AgentPoolsClient interface defines the methods needed for scaling vms pool.
+// it is implemented by track2 sdk armcontainerservice.AgentPoolsClient
+type AgentPoolsClient interface {
+	Get(ctx context.Context,
+		resourceGroupName, resourceName, agentPoolName string,
+		options *armcontainerservice.AgentPoolsClientGetOptions) (
+		armcontainerservice.AgentPoolsClientGetResponse, error)
+	BeginCreateOrUpdate(
+		ctx context.Context,
+		resourceGroupName, resourceName, agentPoolName string,
+		parameters armcontainerservice.AgentPool,
+		options *armcontainerservice.AgentPoolsClientBeginCreateOrUpdateOptions) (
+		*runtime.Poller[armcontainerservice.AgentPoolsClientCreateOrUpdateResponse], error)
+	BeginDeleteMachines(
+		ctx context.Context,
+		resourceGroupName, resourceName, agentPoolName string,
+		machines armcontainerservice.AgentPoolDeleteMachinesParameter,
+		options *armcontainerservice.AgentPoolsClientBeginDeleteMachinesOptions) (
+		*runtime.Poller[armcontainerservice.AgentPoolsClientDeleteMachinesResponse], error)
+	NewListPager(
+		resourceGroupName, resourceName string,
+		options *armcontainerservice.AgentPoolsClientListOptions,
+	) *runtime.Pager[armcontainerservice.AgentPoolsClientListResponse]
 }
 
-type azDeploymentsClient struct {
-	client resources.DeploymentsClient
-}
+func getAgentpoolClientCredentials(cfg *Config) (azcore.TokenCredential, error) {
+	if cfg.AuthMethod == "" || cfg.AuthMethod == authMethodPrincipal {
+		// Use MSI
+		if cfg.UseManagedIdentityExtension {
+			// Use System Assigned MSI
+			if cfg.UserAssignedIdentityID == "" {
+				klog.V(4).Info("Agentpool client: using System Assigned MSI to retrieve access token")
+				return azidentity.NewManagedIdentityCredential(nil)
+			}
+			// Use User Assigned MSI
+			klog.V(4).Info("Agentpool client: using User Assigned MSI to retrieve access token")
+			return azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
+				ID: azidentity.ClientID(cfg.UserAssignedIdentityID),
+			})
+		}
 
-func newAzDeploymentsClient(subscriptionID, endpoint string, authorizer autorest.Authorizer) *azDeploymentsClient {
-	deploymentsClient := resources.NewDeploymentsClient(subscriptionID)
-	deploymentsClient.BaseURI = endpoint
-	deploymentsClient.Authorizer = authorizer
-	deploymentsClient.PollingDelay = 5 * time.Second
-	configureUserAgent(&deploymentsClient.Client)
+		// Use Service Principal with ClientID and ClientSecret
+		if cfg.AADClientID != "" && cfg.AADClientSecret != "" {
+			klog.V(2).Infoln("Agentpool client: using client_id+client_secret to retrieve access token")
+			return azidentity.NewClientSecretCredential(cfg.TenantID, cfg.AADClientID, cfg.AADClientSecret, nil)
+		}
 
-	return &azDeploymentsClient{
-		client: deploymentsClient,
+		// Use Service Principal with ClientCert and AADClientCertPassword
+		if cfg.AADClientID != "" && cfg.AADClientCertPath != "" {
+			klog.V(2).Infoln("Agentpool client: using client_cert+client_private_key to retrieve access token")
+			certData, err := os.ReadFile(cfg.AADClientCertPath)
+			if err != nil {
+				return nil, fmt.Errorf("reading the client certificate from file %s failed with error: %w", cfg.AADClientCertPath, err)
+			}
+			certs, privateKey, err := azidentity.ParseCertificates(certData, []byte(cfg.AADClientCertPassword))
+			if err != nil {
+				return nil, fmt.Errorf("parsing service principal certificate data failed with error: %w", err)
+			}
+			return azidentity.NewClientCertificateCredential(cfg.TenantID, cfg.AADClientID, certs, privateKey, &azidentity.ClientCertificateCredentialOptions{
+				SendCertificateChain: true,
+			})
+		}
 	}
-}
 
-func (az *azDeploymentsClient) Get(ctx context.Context, resourceGroupName string, deploymentName string) (result resources.DeploymentExtended, err error) {
-	klog.V(10).Infof("azDeploymentsClient.Get(%q,%q): start", resourceGroupName, deploymentName)
-	defer func() {
-		klog.V(10).Infof("azDeploymentsClient.Get(%q,%q): end", resourceGroupName, deploymentName)
-	}()
-
-	return az.client.Get(ctx, resourceGroupName, deploymentName)
-}
-
-func (az *azDeploymentsClient) ExportTemplate(ctx context.Context, resourceGroupName string, deploymentName string) (result resources.DeploymentExportResult, err error) {
-	klog.V(10).Infof("azDeploymentsClient.ExportTemplate(%q,%q): start", resourceGroupName, deploymentName)
-	defer func() {
-		klog.V(10).Infof("azDeploymentsClient.ExportTemplate(%q,%q): end", resourceGroupName, deploymentName)
-	}()
-
-	return az.client.ExportTemplate(ctx, resourceGroupName, deploymentName)
-}
-
-func (az *azDeploymentsClient) CreateOrUpdate(ctx context.Context, resourceGroupName string, deploymentName string, parameters resources.Deployment) (resp *http.Response, err error) {
-	klog.V(10).Infof("azDeploymentsClient.CreateOrUpdate(%q,%q): start", resourceGroupName, deploymentName)
-	defer func() {
-		klog.V(10).Infof("azDeploymentsClient.CreateOrUpdate(%q,%q): end", resourceGroupName, deploymentName)
-	}()
-
-	future, err := az.client.CreateOrUpdate(ctx, resourceGroupName, deploymentName, parameters)
-	if err != nil {
-		return future.Response(), err
+	if cfg.UseFederatedWorkloadIdentityExtension {
+		klog.V(4).Info("Agentpool client: using workload identity for access token")
+		return azidentity.NewWorkloadIdentityCredential(&azidentity.WorkloadIdentityCredentialOptions{
+			TokenFilePath: cfg.AADFederatedTokenFile,
+		})
 	}
 
-	err = future.WaitForCompletionRef(ctx, az.client.Client)
-	return future.Response(), err
+	return nil, fmt.Errorf("unsupported authorization method: %s", cfg.AuthMethod)
 }
 
-func (az *azDeploymentsClient) List(ctx context.Context, resourceGroupName, filter string, top *int32) (result []resources.DeploymentExtended, err error) {
-	klog.V(10).Infof("azDeploymentsClient.List(%q): start", resourceGroupName)
-	defer func() {
-		klog.V(10).Infof("azDeploymentsClient.List(%q): end", resourceGroupName)
-	}()
-
-	iterator, err := az.client.ListByResourceGroupComplete(ctx, resourceGroupName, filter, top)
+func newAgentpoolClient(cfg *Config) (AgentPoolsClient, error) {
+	retryOptions := azextensions.DefaultRetryOpts()
+	cred, err := getAgentpoolClientCredentials(cfg)
 	if err != nil {
+		klog.Errorf("failed to get agent pool client credentials: %v", err)
 		return nil, err
 	}
 
-	result = make([]resources.DeploymentExtended, 0)
-	for ; iterator.NotDone(); err = iterator.Next() {
+	env := azure.PublicCloud // default to public cloud
+	if cfg.Cloud != "" {
+		var err error
+		env, err = azure.EnvironmentFromName(cfg.Cloud)
 		if err != nil {
+			klog.Errorf("failed to get environment from name %s: with error: %v", cfg.Cloud, err)
 			return nil, err
 		}
-
-		result = append(result, iterator.Value())
 	}
 
-	return result, err
+	if cfg.ARMBaseURLForAPClient != "" {
+		klog.V(10).Infof("Using ARMBaseURLForAPClient to create agent pool client")
+		return newAgentpoolClientWithConfig(cfg.SubscriptionID, cred, cfg.ARMBaseURLForAPClient, env.TokenAudience, retryOptions, true /*insecureAllowCredentialWithHTTP*/)
+	}
+
+	return newAgentpoolClientWithConfig(cfg.SubscriptionID, cred, env.ResourceManagerEndpoint, env.TokenAudience, retryOptions, false /*insecureAllowCredentialWithHTTP*/)
 }
 
-func (az *azDeploymentsClient) Delete(ctx context.Context, resourceGroupName, deploymentName string) (resp *http.Response, err error) {
-	klog.V(10).Infof("azDeploymentsClient.Delete(%q,%q): start", resourceGroupName, deploymentName)
-	defer func() {
-		klog.V(10).Infof("azDeploymentsClient.Delete(%q,%q): end", resourceGroupName, deploymentName)
-	}()
+func newAgentpoolClientWithConfig(subscriptionID string, cred azcore.TokenCredential,
+	cloudCfgEndpoint, cloudCfgAudience string, retryOptions azurecore_policy.RetryOptions, insecureAllowCredentialWithHTTP bool) (AgentPoolsClient, error) {
+	agentPoolsClient, err := armcontainerservice.NewAgentPoolsClient(subscriptionID, cred,
+		&policy.ClientOptions{
+			ClientOptions: azurecore_policy.ClientOptions{
+				Cloud: cloud.Configuration{
+					Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+						cloud.ResourceManager: {
+							Endpoint: cloudCfgEndpoint,
+							Audience: cloudCfgAudience,
+						},
+					},
+				},
+				InsecureAllowCredentialWithHTTP: insecureAllowCredentialWithHTTP,
+				Telemetry:                       azextensions.DefaultTelemetryOpts(getUserAgentExtension()),
+				Transport:                       azextensions.DefaultHTTPClient(),
+				Retry:                           retryOptions,
+			},
+		})
 
-	future, err := az.client.Delete(ctx, resourceGroupName, deploymentName)
 	if err != nil {
-		return future.Response(), err
+		return nil, fmt.Errorf("failed to init cluster agent pools client: %w", err)
 	}
 
-	err = future.WaitForCompletionRef(ctx, az.client.Client)
-	return future.Response(), err
-}
-
-type azAccountsClient struct {
-	client storage.AccountsClient
+	klog.V(10).Infof("Successfully created agent pool client with ARMBaseURL")
+	return agentPoolsClient, nil
 }
 
 type azClient struct {
-	virtualMachineScaleSetsClient   vmssclient.Interface
-	virtualMachineScaleSetVMsClient vmssvmclient.Interface
-	virtualMachinesClient           vmclient.Interface
-	deploymentsClient               DeploymentsClient
+	clientFactory                   azclient.ClientFactory
+	virtualMachineScaleSetsClient   virtualmachinescalesetclient.Interface
+	virtualMachineScaleSetVMsClient virtualmachinescalesetvmclient.Interface
+	virtualMachinesClient           virtualmachineclient.Interface
+	deploymentClient                DeploymentClient
 	interfacesClient                interfaceclient.Interface
 	disksClient                     diskclient.Interface
-	storageAccountsClient           storageaccountclient.Interface
-	managedKubernetesServicesClient containerserviceclient.Interface
-	skuClient                       compute.ResourceSkusClient
+	storageAccountsClient           accountclient.Interface
+	skuClient                       *armcomputev7.ResourceSKUsClient
+	agentPoolClient                 AgentPoolsClient
+	// Wrapper for delete operations
+	vmssClientForDelete VMSSDeleteClient
 }
 
-// newServicePrincipalTokenFromCredentials creates a new ServicePrincipalToken using values of the
-// passed credentials map.
-func newServicePrincipalTokenFromCredentials(config *Config, env *azure.Environment) (*adal.ServicePrincipalToken, error) {
-	oauthConfig, err := adal.NewOAuthConfig(env.ActiveDirectoryEndpoint, config.TenantID)
-	if err != nil {
-		return nil, fmt.Errorf("creating the OAuth config: %v", err)
+func newARMClientConfig(cfg *Config, env *azure.Environment) *azclient.ARMClientConfig {
+	armConfig := &azclient.ARMClientConfig{
+		Cloud:                   cfg.Cloud,
+		TenantID:                cfg.TenantID,
+		UserAgent:               getUserAgentExtension(),
+		ResourceManagerEndpoint: env.ResourceManagerEndpoint,
+		DisableAzureStackCloud:  cfg.DisableAzureStackCloud,
 	}
 
-	if config.UseWorkloadIdentityExtension {
-		klog.V(2).Infoln("azure: using workload identity extension to retrieve access token")
-		jwt, err := os.ReadFile(config.AADFederatedTokenFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read a file with a federated token: %v", err)
-		}
-		token, err := adal.NewServicePrincipalTokenFromFederatedToken(*oauthConfig, config.AADClientID, string(jwt), env.ResourceManagerEndpoint)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create a workload identity token: %v", err)
-		}
-		return token, nil
+	// Apply proxy URL or hosted subscription overrides
+	if cfg.HostedResourceProxyURL != "" {
+		armConfig.ResourceManagerEndpoint = cfg.HostedResourceProxyURL
 	}
-	if config.UseManagedIdentityExtension {
-		klog.V(2).Infoln("azure: using managed identity extension to retrieve access token")
-		msiEndpoint, err := adal.GetMSIVMEndpoint()
-		if err != nil {
-			return nil, fmt.Errorf("getting the managed service identity endpoint: %v", err)
-		}
-		if len(config.UserAssignedIdentityID) > 0 {
-			klog.V(4).Info("azure: using User Assigned MSI ID to retrieve access token")
-			return adal.NewServicePrincipalTokenFromMSIWithUserAssignedID(msiEndpoint,
-				env.ServiceManagementEndpoint,
-				config.UserAssignedIdentityID)
-		}
-		klog.V(4).Info("azure: using System Assigned MSI to retrieve access token")
-		return adal.NewServicePrincipalTokenFromMSI(
-			msiEndpoint,
-			env.ServiceManagementEndpoint)
-	}
-
-	if len(config.AADClientSecret) > 0 {
-		klog.V(2).Infoln("azure: using client_id+client_secret to retrieve access token")
-		return adal.NewServicePrincipalToken(
-			*oauthConfig,
-			config.AADClientID,
-			config.AADClientSecret,
-			env.ServiceManagementEndpoint)
-	}
-
-	if len(config.AADClientCertPath) > 0 && len(config.AADClientCertPassword) > 0 {
-		klog.V(2).Infoln("azure: using jwt client_assertion (client_cert+client_private_key) to retrieve access token")
-		certData, err := ioutil.ReadFile(config.AADClientCertPath)
-		if err != nil {
-			return nil, fmt.Errorf("reading the client certificate from file %s: %v", config.AADClientCertPath, err)
-		}
-		certificate, privateKey, err := decodePkcs12(certData, config.AADClientCertPassword)
-		if err != nil {
-			return nil, fmt.Errorf("decoding the client certificate: %v", err)
-		}
-		return adal.NewServicePrincipalTokenFromCertificate(
-			*oauthConfig,
-			config.AADClientID,
-			certificate,
-			privateKey,
-			env.ServiceManagementEndpoint)
-	}
-
-	return nil, fmt.Errorf("no credentials provided for AAD application %s", config.AADClientID)
-}
-
-func newAuthorizer(config *Config, env *azure.Environment) (autorest.Authorizer, error) {
-	switch config.AuthMethod {
-	case authMethodCLI:
-		return auth.NewAuthorizerFromCLI()
-	case "", authMethodPrincipal:
-		token, err := newServicePrincipalTokenFromCredentials(config, env)
-		if err != nil {
-			return nil, fmt.Errorf("retrieve service principal token: %v", err)
-		}
-		return autorest.NewBearerAuthorizer(token), nil
-	default:
-		return nil, fmt.Errorf("unsupported authorization method: %s", config.AuthMethod)
-	}
+	return armConfig
 }
 
 func newAzClient(cfg *Config, env *azure.Environment) (*azClient, error) {
-	authorizer, err := newAuthorizer(cfg, env)
-	if err != nil {
-		return nil, err
+	armConfig := newARMClientConfig(cfg, env)
+
+	// Create AzureAuthConfig for auth provider
+	authConfig := &azclient.AzureAuthConfig{
+		AADClientID:                           cfg.AADClientID,
+		AADClientSecret:                       cfg.AADClientSecret,
+		AADClientCertPath:                     cfg.AADClientCertPath,
+		AADClientCertPassword:                 cfg.AADClientCertPassword,
+		UseManagedIdentityExtension:           cfg.UseManagedIdentityExtension,
+		UserAssignedIdentityID:                cfg.UserAssignedIdentityID,
+		AADFederatedTokenFile:                 cfg.AADFederatedTokenFile,
+		UseFederatedWorkloadIdentityExtension: cfg.UseFederatedWorkloadIdentityExtension,
 	}
 
-	azClientConfig := cfg.getAzureClientConfig(authorizer, env)
-	azClientConfig.UserAgent = getUserAgentExtension()
+	// Create auth provider
+	authProvider, err := azclient.NewAuthProvider(armConfig, authConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create auth provider: %w", err)
+	}
 
-	vmssClientConfig := azClientConfig.WithRateLimiter(cfg.VirtualMachineScaleSetRateLimit)
-	scaleSetsClient := vmssclient.New(vmssClientConfig)
-	klog.V(5).Infof("Created scale set client with authorizer: %v", scaleSetsClient)
+	// Get credentials from auth provider
+	cred := authProvider.GetAzIdentity()
+	if cred == nil {
+		return nil, fmt.Errorf("failed to get Azure credentials from auth provider")
+	}
 
-	vmssVMClientConfig := azClientConfig.WithRateLimiter(cfg.VirtualMachineScaleSetRateLimit)
-	scaleSetVMsClient := vmssvmclient.New(vmssVMClientConfig)
-	klog.V(5).Infof("Created scale set vm client with authorizer: %v", scaleSetVMsClient)
+	// Create ClientFactoryConfig with subscription ID and rate limit settings
+	subscriptionID := cfg.SubscriptionID
+	if cfg.HostedSubscriptionID != "" {
+		subscriptionID = cfg.HostedSubscriptionID
+	}
 
-	vmClientConfig := azClientConfig.WithRateLimiter(cfg.VirtualMachineRateLimit)
-	virtualMachinesClient := vmclient.New(vmClientConfig)
-	klog.V(5).Infof("Created vm client with authorizer: %v", virtualMachinesClient)
+	factoryConfig := &azclient.ClientFactoryConfig{
+		SubscriptionID:               subscriptionID,
+		CloudProviderRateLimitConfig: cfg.CloudProviderRateLimitConfig,
+	}
 
-	deploymentsClient := newAzDeploymentsClient(cfg.SubscriptionID, env.ResourceManagerEndpoint, authorizer)
-	klog.V(5).Infof("Created deployments client with authorizer: %v", deploymentsClient)
+	// Create cloud configuration for NewClientFactory
+	cloudConfig := cloud.Configuration{
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Endpoint: armConfig.ResourceManagerEndpoint,
+				Audience: env.TokenAudience,
+			},
+		},
+	}
 
-	interfaceClientConfig := azClientConfig.WithRateLimiter(cfg.InterfaceRateLimit)
-	interfacesClient := interfaceclient.New(interfaceClientConfig)
-	klog.V(5).Infof("Created interfaces client with authorizer: %v", interfacesClient)
+	// Create client factory
+	clientFactory, err := azclient.NewClientFactory(factoryConfig, armConfig, cloudConfig, cred)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create azclient factory: %w", err)
+	}
+	klog.V(5).Infof("Created Azure client factory")
 
-	accountClientConfig := azClientConfig.WithRateLimiter(cfg.StorageAccountRateLimit)
-	storageAccountsClient := storageaccountclient.New(accountClientConfig)
-	klog.V(5).Infof("Created storage accounts client with authorizer: %v", storageAccountsClient)
+	// Create SKU client separately using v7 (it's not part of the factory, and skewer v2 requires v7)
+	skuClient, err := armcomputev7.NewResourceSKUsClient(subscriptionID, cred, &policy.ClientOptions{
+		ClientOptions: azurecore_policy.ClientOptions{
+			Cloud: cloud.Configuration{
+				Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+					cloud.ResourceManager: {
+						Endpoint: armConfig.ResourceManagerEndpoint,
+						Audience: env.TokenAudience,
+					},
+				},
+			},
+			Telemetry: azextensions.DefaultTelemetryOpts(getUserAgentExtension()),
+			Transport: azextensions.DefaultHTTPClient(),
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SKU client: %w", err)
+	}
+	klog.V(5).Infof("Created sku client")
 
-	diskClientConfig := azClientConfig.WithRateLimiter(cfg.DiskRateLimit)
-	disksClient := diskclient.New(diskClientConfig)
-	klog.V(5).Infof("Created disks client with authorizer: %v", disksClient)
+	// Create agent pool client
+	agentPoolClient, err := newAgentpoolClient(cfg)
+	if err != nil {
+		klog.Errorf("newAgentpoolClient failed with error: %s", err)
+		if cfg.EnableVMsAgentPool {
+			// only return error if VMs agent pool is supported which is controlled by toggle
+			return nil, err
+		}
+	}
 
-	aksClientConfig := azClientConfig.WithRateLimiter(cfg.KubernetesServiceRateLimit)
-	kubernetesServicesClient := containerserviceclient.New(aksClientConfig)
-	klog.V(5).Infof("Created kubernetes services client with authorizer: %v", kubernetesServicesClient)
+	// Get VMSS client from ClientFactory - the azclient's Client embeds the SDK client
+	// which provides access to BeginDeleteInstances
+	vmssClient := clientFactory.GetVirtualMachineScaleSetClient()
 
-	// Reference on why selecting ResourceManagerEndpoint as baseURI -
-	// https://github.com/Azure/go-autorest/blob/main/autorest/azure/environments.go
-	skuClient := compute.NewResourceSkusClientWithBaseURI(azClientConfig.ResourceManagerEndpoint, cfg.SubscriptionID)
-	skuClient.Authorizer = azClientConfig.Authorizer
-	klog.V(5).Infof("Created sku client with authorizer: %v", skuClient)
+	vmssClientForDelete := NewVMSSDeleteClient(vmssClient)
+	if vmssClientForDelete == nil {
+		return nil, fmt.Errorf("failed to create VMSS delete client wrapper: unexpected client type")
+	}
+
+	deploymentClient := NewDeploymentClient(clientFactory.GetDeploymentClient())
+	if deploymentClient == nil {
+		return nil, fmt.Errorf("failed to create deployment client wrapper: unexpected client type")
+	}
 
 	return &azClient{
-		disksClient:                     disksClient,
-		interfacesClient:                interfacesClient,
-		virtualMachineScaleSetsClient:   scaleSetsClient,
-		virtualMachineScaleSetVMsClient: scaleSetVMsClient,
-		deploymentsClient:               deploymentsClient,
-		virtualMachinesClient:           virtualMachinesClient,
-		storageAccountsClient:           storageAccountsClient,
-		managedKubernetesServicesClient: kubernetesServicesClient,
+		clientFactory:                   clientFactory,
+		virtualMachineScaleSetsClient:   vmssClient,
+		virtualMachineScaleSetVMsClient: clientFactory.GetVirtualMachineScaleSetVMClient(),
+		virtualMachinesClient:           clientFactory.GetVirtualMachineClient(),
+		deploymentClient:                NewDeploymentClient(clientFactory.GetDeploymentClient()),
+		interfacesClient:                clientFactory.GetInterfaceClient(),
+		disksClient:                     clientFactory.GetDiskClient(),
+		storageAccountsClient:           clientFactory.GetAccountClient(),
 		skuClient:                       skuClient,
+		agentPoolClient:                 agentPoolClient,
+		vmssClientForDelete:             vmssClientForDelete,
 	}, nil
 }

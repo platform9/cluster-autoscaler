@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/mock"
+
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 )
 
@@ -68,11 +69,11 @@ func (m *MockHistogram) String() string {
 }
 
 // SaveToChekpoint is a mock implementation of Histogram.SaveToChekpoint.
-func (m *MockHistogram) SaveToChekpoint() (*vpa_types.HistogramCheckpoint, error) {
+func (*MockHistogram) SaveToChekpoint() (*vpa_types.HistogramCheckpoint, error) {
 	return &vpa_types.HistogramCheckpoint{}, nil
 }
 
 // LoadFromCheckpoint is a mock implementation of Histogram.LoadFromCheckpoint.
-func (m *MockHistogram) LoadFromCheckpoint(checkpoint *vpa_types.HistogramCheckpoint) error {
+func (*MockHistogram) LoadFromCheckpoint(checkpoint *vpa_types.HistogramCheckpoint) error {
 	return nil
 }

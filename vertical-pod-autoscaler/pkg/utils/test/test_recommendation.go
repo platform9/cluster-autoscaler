@@ -17,7 +17,9 @@ limitations under the License.
 package test
 
 import (
-	apiv1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 )
 
@@ -25,11 +27,14 @@ import (
 type RecommendationBuilder interface {
 	WithContainer(containerName string) RecommendationBuilder
 	WithTarget(cpu, memory string) RecommendationBuilder
+	WithTargetResource(resource corev1.ResourceName, value string) RecommendationBuilder
 	WithLowerBound(cpu, memory string) RecommendationBuilder
 	WithUpperBound(cpu, memory string) RecommendationBuilder
 	Get() *vpa_types.RecommendedPodResources
 	GetContainerResources() vpa_types.RecommendedContainerResources
 }
+
+// TODO part of this interface is repeated in VerticalPodAutoscalerBuilder, we can probably factorize some code
 
 // Recommendation returns a new RecommendationBuilder.
 func Recommendation() RecommendationBuilder {
@@ -38,9 +43,9 @@ func Recommendation() RecommendationBuilder {
 
 type recommendationBuilder struct {
 	containerName string
-	target        apiv1.ResourceList
-	lowerBound    apiv1.ResourceList
-	upperBound    apiv1.ResourceList
+	target        corev1.ResourceList
+	lowerBound    corev1.ResourceList
+	upperBound    corev1.ResourceList
 }
 
 func (b *recommendationBuilder) WithContainer(containerName string) RecommendationBuilder {
@@ -52,6 +57,15 @@ func (b *recommendationBuilder) WithContainer(containerName string) Recommendati
 func (b *recommendationBuilder) WithTarget(cpu, memory string) RecommendationBuilder {
 	c := *b
 	c.target = Resources(cpu, memory)
+	return &c
+}
+
+func (b *recommendationBuilder) WithTargetResource(resource corev1.ResourceName, value string) RecommendationBuilder {
+	c := *b
+	if c.target == nil {
+		c.target = corev1.ResourceList{}
+	}
+	addResource(c.target, resource, value)
 	return &c
 }
 
@@ -91,4 +105,14 @@ func (b *recommendationBuilder) GetContainerResources() vpa_types.RecommendedCon
 		LowerBound:     b.lowerBound,
 		UpperBound:     b.upperBound,
 	}
+}
+
+// addResource add a resource to the given resource list
+func addResource(rl corev1.ResourceList, resourceName corev1.ResourceName, value string) corev1.ResourceList {
+	val, _ := resource.ParseQuantity(value)
+	if rl == nil {
+		rl = corev1.ResourceList{}
+	}
+	rl[resourceName] = val
+	return rl
 }

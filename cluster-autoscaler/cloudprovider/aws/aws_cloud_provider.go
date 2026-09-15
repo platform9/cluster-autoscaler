@@ -17,6 +17,7 @@ limitations under the License.
 package aws
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -25,17 +26,34 @@ import (
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
+	"k8s.io/client-go/informers"
 	klog "k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider/builder"
+	"sigs.k8s.io/cluster-autoscaler/pkg/config"
+	coreoptions "sigs.k8s.io/cluster-autoscaler/pkg/core/options"
+	"sigs.k8s.io/cluster-autoscaler/pkg/processors/nodegroupset"
+	"sigs.k8s.io/cluster-autoscaler/pkg/processors/nodeinfosprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/simulator/framework"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/errors"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/gpu"
 )
+
+// ProviderName is the cloud provider name for this provider.
+const ProviderName = "aws"
+
+func init() {
+	builder.RegisterCloudProvider(ProviderName, func(opts *coreoptions.AutoscalerOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter, informerFactory informers.SharedInformerFactory) cloudprovider.CloudProvider {
+		return BuildAWS(opts, do, rl)
+	})
+	builder.SetDefaultCloudProvider(ProviderName)
+}
 
 const (
 	// GPULabel is the label added to nodes with GPU resource.
 	GPULabel = "k8s.amazonaws.com/accelerator"
+	// nodeNotPresentErr indicates no node with the given identifier present in AWS
+	nodeNotPresentErr = "node is not present in aws"
 )
 
 var (
@@ -46,6 +64,8 @@ var (
 		"nvidia-tesla-t4":   {},
 		"nvidia-tesla-a100": {},
 		"nvidia-a10g":       {},
+		"nvidia-l4":         {},
+		"nvidia-l40s":       {},
 	}
 )
 
@@ -65,34 +85,34 @@ func BuildAwsCloudProvider(awsManager *AwsManager, resourceLimiter *cloudprovide
 }
 
 // Cleanup stops the go routine that is handling the current view of the ASGs in the form of a cache
-func (aws *awsCloudProvider) Cleanup() error {
+func (aws *awsCloudProvider) Cleanup(ctx context.Context) error {
 	aws.awsManager.Cleanup()
 	return nil
 }
 
 // Name returns name of the cloud provider.
 func (aws *awsCloudProvider) Name() string {
-	return cloudprovider.AwsProviderName
+	return ProviderName
 }
 
 // GPULabel returns the label added to nodes with GPU resource.
-func (aws *awsCloudProvider) GPULabel() string {
+func (aws *awsCloudProvider) GPULabel(ctx context.Context) string {
 	return GPULabel
 }
 
 // GetAvailableGPUTypes return all available GPU types cloud provider supports
-func (aws *awsCloudProvider) GetAvailableGPUTypes() map[string]struct{} {
+func (aws *awsCloudProvider) GetAvailableGPUTypes(ctx context.Context) map[string]struct{} {
 	return availableGPUTypes
 }
 
 // GetNodeGpuConfig returns the label, type and resource name for the GPU added to node. If node doesn't have
 // any GPUs, it returns nil.
-func (aws *awsCloudProvider) GetNodeGpuConfig(node *apiv1.Node) *cloudprovider.GpuConfig {
-	return gpu.GetNodeGPUFromCloudProvider(aws, node)
+func (aws *awsCloudProvider) GetNodeGpuConfig(ctx context.Context, node *apiv1.Node) *cloudprovider.GpuConfig {
+	return gpu.GetNodeGPUFromCloudProvider(context.TODO(), aws, node)
 }
 
 // NodeGroups returns all node groups configured for this cloud provider.
-func (aws *awsCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
+func (aws *awsCloudProvider) NodeGroups(ctx context.Context) []cloudprovider.NodeGroup {
 	asgs := aws.awsManager.getAsgs()
 	ngs := make([]cloudprovider.NodeGroup, 0, len(asgs))
 	for _, asg := range asgs {
@@ -106,14 +126,16 @@ func (aws *awsCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 }
 
 // NodeGroupForNode returns the node group for the given node.
-func (aws *awsCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.NodeGroup, error) {
+func (aws *awsCloudProvider) NodeGroupForNode(ctx context.Context, node *apiv1.Node) (cloudprovider.NodeGroup, error) {
 	if len(node.Spec.ProviderID) == 0 {
 		klog.Warningf("Node %v has no providerId", node.Name)
 		return nil, nil
 	}
 	ref, err := AwsRefFromProviderId(node.Spec.ProviderID)
 	if err != nil {
-		return nil, err
+		// Dropping this into V as it will be noisy with many Hybrid Nodes
+		klog.V(6).Infof("Node %v has unrecognized providerId: %v", node.Name, node.Spec.ProviderID)
+		return nil, nil
 	}
 	asg := aws.awsManager.GetAsgForInstance(*ref)
 
@@ -128,7 +150,23 @@ func (aws *awsCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.N
 }
 
 // HasInstance returns whether a given node has a corresponding instance in this cloud provider
-func (aws *awsCloudProvider) HasInstance(node *apiv1.Node) (bool, error) {
+func (aws *awsCloudProvider) HasInstance(ctx context.Context, node *apiv1.Node) (bool, error) {
+	// we haven't implemented a way to check if a fargate instance
+	// exists in the cloud provider
+	// returning 'true' because we are assuming the node exists in AWS
+	// this is the default behavior if the check is unimplemented
+	if strings.HasPrefix(node.GetName(), "fargate") {
+		return true, cloudprovider.ErrNotImplemented
+	}
+
+	// avoid log spam for not autoscaled asgs:
+	//   Nodes that belong to an asg that is not autoscaled will not be found in the asgCache below,
+	//   so do not trigger warning spam by returning an error from being unable to find them.
+	//   Annotation is not automated, but users that see the warning can add the annotation to avoid it.
+	if node.Annotations != nil && node.Annotations["k8s.io/cluster-autoscaler-enabled"] == "false" {
+		return false, nil
+	}
+
 	awsRef, err := AwsRefFromProviderId(node.Spec.ProviderID)
 	if err != nil {
 		return false, err
@@ -140,34 +178,34 @@ func (aws *awsCloudProvider) HasInstance(node *apiv1.Node) (bool, error) {
 		return true, nil
 	}
 
-	return false, fmt.Errorf("node is not present in aws: %v", err)
+	return false, fmt.Errorf("%s: %v", nodeNotPresentErr, err)
 }
 
 // Pricing returns pricing model for this cloud provider or error if not available.
-func (aws *awsCloudProvider) Pricing() (cloudprovider.PricingModel, errors.AutoscalerError) {
+func (aws *awsCloudProvider) Pricing(ctx context.Context) (cloudprovider.PricingModel, errors.AutoscalerError) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // GetAvailableMachineTypes get all machine types that can be requested from the cloud provider.
-func (aws *awsCloudProvider) GetAvailableMachineTypes() ([]string, error) {
+func (aws *awsCloudProvider) GetAvailableMachineTypes(ctx context.Context) ([]string, error) {
 	return []string{}, nil
 }
 
 // NewNodeGroup builds a theoretical node group based on the node definition provided. The node group is not automatically
 // created on the cloud provider side. The node group is not returned by NodeGroups() until it is created.
-func (aws *awsCloudProvider) NewNodeGroup(machineType string, labels map[string]string, systemLabels map[string]string,
+func (aws *awsCloudProvider) NewNodeGroup(ctx context.Context, machineType string, labels map[string]string, systemLabels map[string]string,
 	taints []apiv1.Taint, extraResources map[string]resource.Quantity) (cloudprovider.NodeGroup, error) {
 	return nil, cloudprovider.ErrNotImplemented
 }
 
 // GetResourceLimiter returns struct containing limits (max, min) for resources (cores, memory etc.).
-func (aws *awsCloudProvider) GetResourceLimiter() (*cloudprovider.ResourceLimiter, error) {
+func (aws *awsCloudProvider) GetResourceLimiter(ctx context.Context) (*cloudprovider.ResourceLimiter, error) {
 	return aws.resourceLimiter, nil
 }
 
 // Refresh is called before every main loop and can be used to dynamically update cloud provider state.
 // In particular the list of node groups returned by NodeGroups can change as a result of CloudProvider.Refresh().
-func (aws *awsCloudProvider) Refresh() error {
+func (aws *awsCloudProvider) Refresh(ctx context.Context) error {
 	return aws.awsManager.Refresh()
 }
 
@@ -204,46 +242,46 @@ type AwsNodeGroup struct {
 }
 
 // MaxSize returns maximum size of the node group.
-func (ng *AwsNodeGroup) MaxSize() int {
+func (ng *AwsNodeGroup) MaxSize(ctx context.Context) int {
 	return ng.asg.maxSize
 }
 
 // MinSize returns minimum size of the node group.
-func (ng *AwsNodeGroup) MinSize() int {
+func (ng *AwsNodeGroup) MinSize(ctx context.Context) int {
 	return ng.asg.minSize
 }
 
 // TargetSize returns the current TARGET size of the node group. It is possible that the
 // number is different from the number of nodes registered in Kubernetes.
-func (ng *AwsNodeGroup) TargetSize() (int, error) {
+func (ng *AwsNodeGroup) TargetSize(ctx context.Context) (int, error) {
 	return ng.asg.curSize, nil
 }
 
 // Exist checks if the node group really exists on the cloud provider side. Allows to tell the
 // theoretical node group from the real one.
-func (ng *AwsNodeGroup) Exist() bool {
+func (ng *AwsNodeGroup) Exist(ctx context.Context) bool {
 	return true
 }
 
 // Create creates the node group on the cloud provider side.
-func (ng *AwsNodeGroup) Create() (cloudprovider.NodeGroup, error) {
+func (ng *AwsNodeGroup) Create(ctx context.Context) (cloudprovider.NodeGroup, error) {
 	return nil, cloudprovider.ErrAlreadyExist
 }
 
 // Autoprovisioned returns true if the node group is autoprovisioned.
-func (ng *AwsNodeGroup) Autoprovisioned() bool {
+func (ng *AwsNodeGroup) Autoprovisioned(ctx context.Context) bool {
 	return false
 }
 
 // Delete deletes the node group on the cloud provider side.
 // This will be executed only for autoprovisioned node groups, once their size drops to 0.
-func (ng *AwsNodeGroup) Delete() error {
+func (ng *AwsNodeGroup) Delete(ctx context.Context) error {
 	return cloudprovider.ErrNotImplemented
 }
 
 // GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
 // NodeGroup. Returning a nil will result in using default options.
-func (ng *AwsNodeGroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
+func (ng *AwsNodeGroup) GetOptions(ctx context.Context, defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
 	if ng.asg == nil || ng.asg.Tags == nil || len(ng.asg.Tags) == 0 {
 		return &defaults, nil
 	}
@@ -251,7 +289,7 @@ func (ng *AwsNodeGroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) 
 }
 
 // IncreaseSize increases Asg size
-func (ng *AwsNodeGroup) IncreaseSize(delta int) error {
+func (ng *AwsNodeGroup) IncreaseSize(ctx context.Context, delta int) error {
 	if delta <= 0 {
 		return fmt.Errorf("size increase must be positive")
 	}
@@ -262,12 +300,17 @@ func (ng *AwsNodeGroup) IncreaseSize(delta int) error {
 	return ng.awsManager.SetAsgSize(ng.asg, size+delta)
 }
 
+// AtomicIncreaseSize is not implemented.
+func (ng *AwsNodeGroup) AtomicIncreaseSize(ctx context.Context, delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DecreaseTargetSize decreases the target size of the node group. This function
 // doesn't permit to delete any existing node and can be used only to reduce the
 // request for new nodes that have not been yet fulfilled. Delta should be negative.
 // It is assumed that cloud provider will not delete the existing nodes if the size
 // when there is an option to just decrease the target.
-func (ng *AwsNodeGroup) DecreaseTargetSize(delta int) error {
+func (ng *AwsNodeGroup) DecreaseTargetSize(ctx context.Context, delta int) error {
 	if delta >= 0 {
 		return fmt.Errorf("size decrease size must be negative")
 	}
@@ -301,9 +344,9 @@ func (ng *AwsNodeGroup) Belongs(node *apiv1.Node) (bool, error) {
 }
 
 // DeleteNodes deletes the nodes from the group.
-func (ng *AwsNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
+func (ng *AwsNodeGroup) DeleteNodes(ctx context.Context, nodes []*apiv1.Node) error {
 	size := ng.asg.curSize
-	if int(size) <= ng.MinSize() {
+	if int(size) <= ng.MinSize(context.TODO()) {
 		return fmt.Errorf("min size reached, nodes will not be deleted")
 	}
 	refs := make([]*AwsInstanceRef, 0, len(nodes))
@@ -324,18 +367,23 @@ func (ng *AwsNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	return ng.awsManager.DeleteInstances(refs)
 }
 
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (ng *AwsNodeGroup) ForceDeleteNodes(ctx context.Context, nodes []*apiv1.Node) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // Id returns asg id.
 func (ng *AwsNodeGroup) Id() string {
 	return ng.asg.Name
 }
 
 // Debug returns a debug string for the Asg.
-func (ng *AwsNodeGroup) Debug() string {
-	return fmt.Sprintf("%s (%d:%d)", ng.Id(), ng.MinSize(), ng.MaxSize())
+func (ng *AwsNodeGroup) Debug(ctx context.Context) string {
+	return fmt.Sprintf("%s (%d:%d)", ng.Id(), ng.MinSize(context.TODO()), ng.MaxSize(context.TODO()))
 }
 
 // Nodes returns a list of all nodes that belong to this node group.
-func (ng *AwsNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
+func (ng *AwsNodeGroup) Nodes(ctx context.Context) ([]cloudprovider.Instance, error) {
 	asgNodes, err := ng.awsManager.GetAsgNodes(ng.asg.AwsRef)
 	if err != nil {
 		return nil, err
@@ -367,7 +415,7 @@ func (ng *AwsNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 }
 
 // TemplateNodeInfo returns a node template for this node group.
-func (ng *AwsNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (ng *AwsNodeGroup) TemplateNodeInfo(ctx context.Context) (*framework.NodeInfo, error) {
 	template, err := ng.awsManager.getAsgTemplate(ng.asg)
 	if err != nil {
 		return nil, err
@@ -378,13 +426,12 @@ func (ng *AwsNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error)
 		return nil, err
 	}
 
-	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(ng.asg.Name))
-	nodeInfo.SetNode(node)
+	nodeInfo := framework.NewNodeInfo(node, nil, framework.NewPodInfo(cloudprovider.BuildKubeProxy(ng.asg.Name), nil))
 	return nodeInfo, nil
 }
 
 // BuildAWS builds AWS cloud provider, manager etc.
-func BuildAWS(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+func BuildAWS(opts *coreoptions.AutoscalerOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
 	var cfg io.ReadCloser
 	if opts.CloudConfig != "" {
 		var err error
@@ -405,7 +452,7 @@ func BuildAWS(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscover
 	if opts.AWSUseStaticInstanceList {
 		klog.Warningf("Using static EC2 Instance Types, this list could be outdated. Last update time: %s", lastUpdateTime)
 	} else {
-		generatedInstanceTypes, err := GenerateEC2InstanceTypes(sdkProvider.session)
+		generatedInstanceTypes, err := GenerateEC2InstanceTypes(sdkProvider.cfg)
 		if err != nil {
 			klog.Errorf("Failed to generate AWS EC2 Instance Types: %v, falling back to static list with last update time: %s", err, lastUpdateTime)
 		}
@@ -442,5 +489,14 @@ func BuildAWS(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscover
 		klog.Fatalf("Failed to create AWS cloud provider: %v", err)
 	}
 	RegisterMetrics()
+
+	// Configure AWS specific processors
+	if opts.Processors != nil {
+		opts.Processors.TemplateNodeInfoProvider = nodeinfosprovider.NewAsgTagResourceNodeInfoProvider(&opts.AutoscalingOptions.NodeInfoCacheExpireTime, opts.AutoscalingOptions.ForceDaemonSets)
+		opts.Processors.NodeGroupSetProcessor = &nodegroupset.BalancingNodeGroupSetProcessor{
+			Comparator: nodegroupset.CreateAwsNodeInfoComparator(opts.AutoscalingOptions.BalancingExtraIgnoredLabels, opts.AutoscalingOptions.NodeGroupSetRatios),
+		}
+	}
+
 	return provider
 }

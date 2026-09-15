@@ -18,14 +18,15 @@ package civo
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	civocloud "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/civo/civo-cloud-sdk-go"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
 )
 
 type civoClientMock struct {
@@ -45,6 +46,11 @@ func (m *civoClientMock) UpdateKubernetesClusterPool(cid, pid string, config *ci
 func (m *civoClientMock) DeleteKubernetesClusterPoolInstance(clusterID, poolID, instanceID string) (*civocloud.SimpleResponse, error) {
 	args := m.Called(clusterID, poolID, instanceID)
 	return args.Get(0).(*civocloud.SimpleResponse), args.Error(1)
+}
+
+func (m *civoClientMock) FindInstanceSizes(size string) (*civocloud.InstanceSize, error) {
+	args := m.Called(size)
+	return args.Get(0).(*civocloud.InstanceSize), args.Error(1)
 }
 
 func testCloudProvider(t *testing.T, client *civoClientMock) *civoCloudProvider {
@@ -101,6 +107,13 @@ func testCloudProvider(t *testing.T, client *civoClientMock) *civoCloudProvider 
 			},
 			nil,
 		).Once()
+
+		client.On("FindInstanceSizes", "small").Return(
+			&civocloud.InstanceSize{
+				Name:     "small",
+				CPUCores: 1,
+			}, nil,
+		).Times(10)
 	}
 
 	manager.client = client
@@ -121,7 +134,7 @@ func TestCivoCloudProvider_Name(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		name := provider.Name()
-		assert.Equal(t, cloudprovider.CivoProviderName, name, "provider name doesn't match")
+		assert.Equal(t, ProviderName, name, "provider name doesn't match")
 	})
 }
 
@@ -129,16 +142,16 @@ func TestCivoCloudProvider_NodeGroups(t *testing.T) {
 	provider := testCloudProvider(t, nil)
 
 	t.Run("success", func(t *testing.T) {
-		nodegroups := provider.NodeGroups()
+		nodegroups := provider.NodeGroups(context.Background())
 		assert.Equal(t, len(nodegroups), 2, "number of node groups does not match")
-		nodes, _ := nodegroups[0].Nodes()
+		nodes, _ := nodegroups[0].Nodes(context.Background())
 		assert.Equal(t, len(nodes), 2, "number of nodes in workers node group does not match")
 
 	})
 
 	t.Run("zero groups", func(t *testing.T) {
 		provider.manager.nodeGroups = []*NodeGroup{}
-		nodes := provider.NodeGroups()
+		nodes := provider.NodeGroups(context.Background())
 		assert.Equal(t, len(nodes), 0, "number of nodes do not match")
 	})
 }
@@ -191,6 +204,13 @@ func TestCivoCloudProvider_NodeGroupForNode(t *testing.T) {
 			nil,
 		).Once()
 
+		client.On("FindInstanceSizes", "").Return(
+			&civocloud.InstanceSize{
+				Name:     "small",
+				CPUCores: 1,
+			}, nil,
+		).Times(10)
+
 		provider := testCloudProvider(t, client)
 
 		// let's get the nodeGroup for the node with ID 11
@@ -200,7 +220,7 @@ func TestCivoCloudProvider_NodeGroupForNode(t *testing.T) {
 			},
 		}
 
-		nodeGroup, err := provider.NodeGroupForNode(node)
+		nodeGroup, err := provider.NodeGroupForNode(context.Background(), node)
 		require.NoError(t, err)
 		require.NotNil(t, nodeGroup)
 		require.Equal(t, nodeGroup.Id(), "1", "node group ID does not match")
@@ -246,6 +266,13 @@ func TestCivoCloudProvider_NodeGroupForNode(t *testing.T) {
 			nil,
 		).Once()
 
+		client.On("FindInstanceSizes", "").Return(
+			&civocloud.InstanceSize{
+				Name:     "small",
+				CPUCores: 1,
+			}, nil,
+		).Times(10)
+
 		provider := testCloudProvider(t, client)
 
 		node := &apiv1.Node{
@@ -254,7 +281,7 @@ func TestCivoCloudProvider_NodeGroupForNode(t *testing.T) {
 			},
 		}
 
-		nodeGroup, err := provider.NodeGroupForNode(node)
+		nodeGroup, err := provider.NodeGroupForNode(context.Background(), node)
 		require.NoError(t, err)
 		require.Nil(t, nodeGroup)
 	})

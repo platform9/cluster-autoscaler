@@ -32,13 +32,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws/aws-sdk-go/aws"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws/aws-sdk-go/service/autoscaling"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws/aws-sdk-go/service/ec2"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws/aws-sdk-go/service/eks"
-	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/autoscaling"
+	autoscalingtypes "github.com/aws/aws-sdk-go-v2/service/autoscaling/types"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
+	"sigs.k8s.io/cluster-autoscaler/pkg/config"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/gpu"
 )
 
 const (
@@ -50,6 +52,7 @@ const (
 	autoDiscovererTypeASG   = "asg"
 	asgAutoDiscovererKeyTag = "tag"
 	optionsTagsPrefix       = "k8s.io/cluster-autoscaler/node-template/autoscaling-options/"
+	labelAwsCSITopologyZone = "topology.ebs.csi.aws.com/zone"
 )
 
 // AwsManager is handles aws communication and data caching.
@@ -65,7 +68,7 @@ type asgTemplate struct {
 	InstanceType *InstanceType
 	Region       string
 	Zone         string
-	Tags         []*autoscaling.TagDescription
+	Tags         []autoscalingtypes.TagDescription
 }
 
 // createAwsManagerInternal allows for custom objects to be passed in by tests
@@ -75,9 +78,14 @@ func createAWSManagerInternal(
 	awsService *awsWrapper,
 	instanceTypes map[string]*InstanceType,
 ) (*AwsManager, error) {
+	klog.Infof("AWS SDK Version: %s", aws.SDKVersion)
+
 	if awsService == nil {
-		sess := awsSDKProvider.session
-		awsService = &awsWrapper{autoscaling.New(sess), ec2.New(sess), eks.New(sess)}
+		awsService = &awsWrapper{
+			autoScalingI: autoscaling.NewFromConfig(awsSDKProvider.cfg, autoscaling.WithEndpointResolver(newAutoscalingOverrideResolver(awsSDKProvider.cloudConfig))),
+			ec2I:         ec2.NewFromConfig(awsSDKProvider.cfg, ec2.WithEndpointResolver(newEc2OverrideResolver(awsSDKProvider.cloudConfig))),
+			eksI:         eks.NewFromConfig(awsSDKProvider.cfg, eks.WithEndpointResolver(newEksOverrideResolver(awsSDKProvider.cloudConfig))),
+		}
 	}
 
 	specs, err := parseASGAutoDiscoverySpecs(discoveryOpts)
@@ -245,6 +253,15 @@ func (m *AwsManager) GetAsgOptions(asg asg, defaults config.NodeGroupAutoscaling
 		}
 	}
 
+	if stringOpt, found := options[config.DefaultIgnoreDaemonSetsUtilizationKey]; found {
+		if opt, err := strconv.ParseBool(stringOpt); err != nil {
+			klog.Warningf("failed to convert asg %s %s tag to bool: %v",
+				asg.Name, config.DefaultIgnoreDaemonSetsUtilizationKey, err)
+		} else {
+			defaults.IgnoreDaemonSetsUtilization = opt
+		}
+	}
+
 	return &defaults
 }
 
@@ -268,9 +285,7 @@ func (m *AwsManager) buildNodeFromTemplate(asg *asg, template *asgTemplate) (*ap
 	node.Status.Capacity[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
 	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(template.InstanceType.MemoryMb*1024*1024, resource.DecimalSI)
 
-	if err := m.updateCapacityWithRequirementsOverrides(&node.Status.Capacity, asg.MixedInstancesPolicy); err != nil {
-		return nil, err
-	}
+	m.updateCapacityWithRequirementsOverrides(&node.Status.Capacity, asg.MixedInstancesPolicy)
 
 	resourcesFromTags := extractAllocatableResourcesFromAsg(template.Tags)
 	klog.V(5).Infof("Extracted resources from ASG tags %v", resourcesFromTags)
@@ -308,6 +323,18 @@ func (m *AwsManager) buildNodeFromTemplate(asg *asg, template *asgTemplate) (*ap
 			node.Spec.Taints = append(node.Spec.Taints, mngTaints...)
 			klog.V(5).Infof("node.Spec.Taints : %+v\n", node.Spec.Taints)
 		}
+
+		mngTags, err := m.managedNodegroupCache.getManagedNodegroupTags(nodegroupName, clusterName)
+		if err != nil {
+			klog.Errorf("Failed to get tags from EKS DescribeNodegroup API for nodegroup %s in cluster %s because %s.", nodegroupName, clusterName, err)
+		} else if mngTags != nil && len(mngTags) > 0 {
+			resourcesFromMngTags := extractAllocatableResourcesFromTags(mngTags)
+			klog.V(5).Infof("Extracted resources from EKS nodegroup tags %v", resourcesFromMngTags)
+			// ManagedNodeGroup resource-indicating tags override conflicting tags on the ASG if they exist
+			for resourceName, val := range resourcesFromMngTags {
+				node.Status.Capacity[apiv1.ResourceName(resourceName)] = *val
+			}
+		}
 	}
 
 	node.Status.Conditions = cloudprovider.BuildReadyConditions()
@@ -333,56 +360,30 @@ func joinNodeLabelsChoosingUserValuesOverAPIValues(extractedLabels map[string]st
 	return result
 }
 
-func (m *AwsManager) updateCapacityWithRequirementsOverrides(capacity *apiv1.ResourceList, policy *mixedInstancesPolicy) error {
-	if policy == nil || len(policy.instanceTypesOverrides) > 0 {
-		return nil
+func (m *AwsManager) updateCapacityWithRequirementsOverrides(capacity *apiv1.ResourceList, policy *mixedInstancesPolicy) {
+	if policy == nil || len(policy.instanceTypesOverrides) > 0 || policy.instanceRequirements == nil {
+		return
 	}
 
-	instanceRequirements, err := m.getInstanceRequirementsFromMixedInstancesPolicy(policy)
-	if err != nil {
-		return fmt.Errorf("error while building node template using instance requirements: (%s)", err)
-	}
+	instanceRequirements := policy.instanceRequirements
 
 	if instanceRequirements.VCpuCount != nil && instanceRequirements.VCpuCount.Min != nil {
-		(*capacity)[apiv1.ResourceCPU] = *resource.NewQuantity(*instanceRequirements.VCpuCount.Min, resource.DecimalSI)
+		(*capacity)[apiv1.ResourceCPU] = *resource.NewQuantity(int64(*instanceRequirements.VCpuCount.Min), resource.DecimalSI)
 	}
 
 	if instanceRequirements.MemoryMiB != nil && instanceRequirements.MemoryMiB.Min != nil {
-		(*capacity)[apiv1.ResourceMemory] = *resource.NewQuantity(*instanceRequirements.MemoryMiB.Min*1024*1024, resource.DecimalSI)
+		(*capacity)[apiv1.ResourceMemory] = *resource.NewQuantity(int64(*instanceRequirements.MemoryMiB.Min)*1024*1024, resource.DecimalSI)
 	}
 
 	for _, manufacturer := range instanceRequirements.AcceleratorManufacturers {
-		if *manufacturer == autoscaling.AcceleratorManufacturerNvidia {
+		if manufacturer == ec2types.AcceleratorManufacturerNvidia {
 			for _, acceleratorType := range instanceRequirements.AcceleratorTypes {
-				if *acceleratorType == autoscaling.AcceleratorTypeGpu {
-					(*capacity)[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(*instanceRequirements.AcceleratorCount.Min, resource.DecimalSI)
+				if acceleratorType == ec2types.AcceleratorTypeGpu {
+					(*capacity)[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(int64(*instanceRequirements.AcceleratorCount.Min), resource.DecimalSI)
 				}
 			}
 		}
 	}
-
-	return nil
-}
-
-func (m *AwsManager) getInstanceRequirementsFromMixedInstancesPolicy(policy *mixedInstancesPolicy) (*ec2.InstanceRequirements, error) {
-	instanceRequirements := &ec2.InstanceRequirements{}
-	if policy.instanceRequirementsOverrides != nil {
-		var err error
-		instanceRequirements, err = m.awsService.getEC2RequirementsFromAutoscaling(policy.instanceRequirementsOverrides)
-		if err != nil {
-			return nil, err
-		}
-	} else if policy.launchTemplate != nil {
-		templateData, err := m.awsService.getLaunchTemplateData(policy.launchTemplate.name, policy.launchTemplate.version)
-		if err != nil {
-			return nil, err
-		}
-
-		if templateData.InstanceRequirements != nil {
-			instanceRequirements = templateData.InstanceRequirements
-		}
-	}
-	return instanceRequirements, nil
 }
 
 func buildGenericLabels(template *asgTemplate, nodeName string) map[string]string {
@@ -395,11 +396,12 @@ func buildGenericLabels(template *asgTemplate, nodeName string) map[string]strin
 
 	result[apiv1.LabelTopologyRegion] = template.Region
 	result[apiv1.LabelTopologyZone] = template.Zone
+	result[labelAwsCSITopologyZone] = template.Zone
 	result[apiv1.LabelHostname] = nodeName
 	return result
 }
 
-func extractLabelsFromAsg(tags []*autoscaling.TagDescription) map[string]string {
+func extractLabelsFromAsg(tags []autoscalingtypes.TagDescription) map[string]string {
 	result := make(map[string]string)
 
 	for _, tag := range tags {
@@ -421,22 +423,22 @@ func extractLabelsFromAsg(tags []*autoscaling.TagDescription) map[string]string 
 	return result
 }
 
-func extractAutoscalingOptionsFromTags(tags []*autoscaling.TagDescription) map[string]string {
+func extractAutoscalingOptionsFromTags(tags []autoscalingtypes.TagDescription) map[string]string {
 	options := make(map[string]string)
 	for _, tag := range tags {
-		if !strings.HasPrefix(aws.StringValue(tag.Key), optionsTagsPrefix) {
+		if !strings.HasPrefix(aws.ToString(tag.Key), optionsTagsPrefix) {
 			continue
 		}
-		splits := strings.Split(aws.StringValue(tag.Key), optionsTagsPrefix)
+		splits := strings.Split(aws.ToString(tag.Key), optionsTagsPrefix)
 		if len(splits) != 2 || splits[1] == "" {
 			continue
 		}
-		options[splits[1]] = aws.StringValue(tag.Value)
+		options[splits[1]] = aws.ToString(tag.Value)
 	}
 	return options
 }
 
-func extractAllocatableResourcesFromAsg(tags []*autoscaling.TagDescription) map[string]*resource.Quantity {
+func extractAllocatableResourcesFromAsg(tags []autoscalingtypes.TagDescription) map[string]*resource.Quantity {
 	result := make(map[string]*resource.Quantity)
 
 	for _, tag := range tags {
@@ -458,7 +460,28 @@ func extractAllocatableResourcesFromAsg(tags []*autoscaling.TagDescription) map[
 	return result
 }
 
-func extractTaintsFromAsg(tags []*autoscaling.TagDescription) []apiv1.Taint {
+func extractAllocatableResourcesFromTags(tags map[string]string) map[string]*resource.Quantity {
+	result := make(map[string]*resource.Quantity)
+
+	for k, v := range tags {
+		splits := strings.Split(k, "k8s.io/cluster-autoscaler/node-template/resources/")
+		if len(splits) > 1 {
+			label := splits[1]
+			if label != "" {
+				quantity, err := resource.ParseQuantity(v)
+				if err != nil {
+					klog.Warningf("Failed to parse resource quanitity '%s' for resource '%s'", v, label)
+					continue
+				}
+				result[label] = &quantity
+			}
+		}
+	}
+
+	return result
+}
+
+func extractTaintsFromAsg(tags []autoscalingtypes.TagDescription) []apiv1.Taint {
 	taints := make([]apiv1.Taint, 0)
 
 	for _, tag := range tags {

@@ -19,7 +19,7 @@ package gce
 import (
 	"testing"
 
-	"k8s.io/autoscaler/cluster-autoscaler/utils/units"
+	"sigs.k8s.io/cluster-autoscaler/pkg/utils/units"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -118,6 +118,7 @@ func TestNewCustomMachineType(t *testing.T) {
 				assert.NoError(t, err)
 				assert.Equal(t, tc.expectCPU, m.CPU)
 				assert.Equal(t, tc.expectMemory, m.Memory)
+				assert.Equal(t, int64(0), m.MaxDiskSizeGb) // unset
 			}
 		})
 	}
